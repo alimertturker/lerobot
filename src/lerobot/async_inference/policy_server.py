@@ -271,12 +271,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             predicted_timesteps = self._predicted_timesteps
 
         if obs.get_timestep() in predicted_timesteps:
-            self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
+            self.logger.info(f"[DIAG] REJECTED obs #{obs.get_timestep()} — timestep already predicted")
             return False
 
         elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
-            self.logger.debug(
-                f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
+            self.logger.info(
+                f"[DIAG] REJECTED obs #{obs.get_timestep()} — too similar to last predicted obs #{previous_obs.get_timestep()} "
+                f"(arm may be stationary near target)"
             )
             return False
 
@@ -293,6 +294,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             or self._obs_sanity_checks(obs, self.last_processed_obs)
         ):
             last_obs = self.last_processed_obs.get_timestep() if self.last_processed_obs else "None"
+            self.logger.info(
+                f"[DIAG] ACCEPTED obs #{obs.get_timestep()} | must_go={obs.must_go} | last_predicted=#{last_obs}"
+            )
             self.logger.debug(
                 f"Enqueuing observation. Must go: {obs.must_go} | Last processed obs: {last_obs}"
             )

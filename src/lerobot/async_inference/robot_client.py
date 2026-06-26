@@ -94,6 +94,13 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        
+        # Store the initial position for teardown
+        initial_obs = self.robot.get_observation()
+        if initial_obs:
+            self.initial_position = {k: v for k, v in initial_obs.items() if isinstance(k, str) and k.endswith(".pos")}
+        else:
+            self.initial_position = None
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -170,10 +177,34 @@ class RobotClient:
             self.logger.error(f"Failed to connect to policy server: {e}")
             return False
 
+    def _return_to_initial_position(self, duration_s: float = 3.0, fps: int = 50) -> None:
+        """Smoothly interpolate the robot back to its initial position."""
+        target = getattr(self, "initial_position", None)
+        if not target:
+            return
+            
+        try:
+            current_obs = self.robot.get_observation()
+            current_pos = {k: v for k, v in current_obs.items() if k in target}
+            steps = max(int(duration_s * fps), 1)
+            for step in range(1, steps + 1):
+                t = step / steps
+                interp = {}
+                for k in current_pos:
+                    interp[k] = current_pos[k] * (1 - t) + target[k] * t
+                self.robot.send_action(interp)
+                time.sleep(1 / fps)
+        except Exception as e:
+            self.logger.warning(f"Could not return to initial position: {e}")
+
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
 
+        if getattr(self.config, "return_to_initial_position", True):
+            self.logger.info("Returning robot to initial position before shutdown...")
+            self._return_to_initial_position()
+            
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
@@ -237,31 +268,46 @@ class RobotClient:
             internal_queue = self.action_queue.queue
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
+        
+        with self.latest_action_lock:
+            latest_action = self.latest_action
 
+        # Keep actions that are not overwritten by incoming actions
+        incoming_timesteps = {a.get_timestep() for a in incoming_actions}
+        
+        # Prepare a dictionary of final actions to easily sort them later
+        final_actions = {}
+        
+        # First, preserve existing future actions
+        for action in internal_queue:
+            if action.get_timestep() > latest_action:
+                final_actions[action.get_timestep()] = action
+                
+        # Now process incoming actions
         for new_action in incoming_actions:
-            with self.latest_action_lock:
-                latest_action = self.latest_action
-
             # New action is older than the latest action in the queue, skip it
             if new_action.get_timestep() <= latest_action:
                 continue
 
             # If the new action's timestep is not in the current action queue, add it directly
-            elif new_action.get_timestep() not in current_action_queue:
-                future_action_queue.put(new_action)
+            if new_action.get_timestep() not in current_action_queue:
+                final_actions[new_action.get_timestep()] = new_action
                 continue
 
             # If the new action's timestep is in the current action queue, aggregate it
             # TODO: There is probably a way to do this with broadcasting of the two action tensors
-            future_action_queue.put(
-                TimedAction(
-                    timestamp=new_action.get_timestamp(),
-                    timestep=new_action.get_timestep(),
-                    action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
-                )
+            aggregated_action = TimedAction(
+                timestamp=new_action.get_timestamp(),
+                timestep=new_action.get_timestep(),
+                action=aggregate_fn(
+                    current_action_queue[new_action.get_timestep()], new_action.get_action()
+                ),
             )
+            final_actions[new_action.get_timestep()] = aggregated_action
+            
+        # Put the sorted final actions into the queue
+        for ts in sorted(final_actions.keys()):
+            future_action_queue.put(final_actions[ts])
 
         with self.action_queue_lock:
             self.action_queue = future_action_queue
@@ -277,7 +323,12 @@ class RobotClient:
                 # Use StreamActions to get a stream of actions from the server
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
                 if len(actions_chunk.data) == 0:
+                    with self.action_queue_lock:
+                        self._pending_observations = False
                     continue  # received `Empty` from server, wait for next call
+
+                with self.action_queue_lock:
+                    self._pending_observations = False
 
                 receive_time = time.time()
 
@@ -335,6 +386,20 @@ class RobotClient:
                 queue_update_time = time.perf_counter() - start_time
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
+
+                with self.latest_action_lock:
+                    _latest = self.latest_action
+                with self.action_queue_lock:
+                    _qsize_after = self.action_queue.qsize()
+                first_ts = timed_actions[0].get_timestep() if timed_actions else -1
+                last_ts = timed_actions[-1].get_timestep() if timed_actions else -1
+                self.logger.info(
+                    f"[DIAG] Actions received: chunk ts={first_ts}..{last_ts} | "
+                    f"n={len(timed_actions)} | "
+                    f"latest_executed=#{_latest} | "
+                    f"queue_after={_qsize_after} | "
+                    f"chunk_is_ahead={first_ts > _latest}"
+                )
 
                 if verbose:
                     # Get queue state after changes
@@ -403,7 +468,34 @@ class RobotClient:
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
         with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+            # If action_chunk_size is not set, allow sending
+            if self.action_chunk_size <= 0:
+                is_below_threshold = True
+            else:
+                is_below_threshold = self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+                
+            if not is_below_threshold:
+                self._pending_observations = False
+                return False
+                
+            # If below threshold, ensure we don't saturate the network while waiting for the inference server
+            now = time.time()
+            if not hasattr(self, "_last_obs_send_time"):
+                self._last_obs_send_time = 0
+                
+            # Avoid sending multiple observations when one is already actively being processed by the server
+            if getattr(self, "_pending_observations", False):
+                # Only timeout and send another if the server has taken longer than 2.0 seconds (e.g. dropped obs)
+                if now - self._last_obs_send_time < 2.0:
+                    return False
+                
+            # A dynamic or static cooldown (e.g. 0.1s or 0.2s) prevents sending 30 observations per second
+            if now - self._last_obs_send_time >= 0.1:
+                self._last_obs_send_time = now
+                self._pending_observations = True
+                return True
+                
+            return False
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
         try:
@@ -424,14 +516,27 @@ class RobotClient:
 
             obs_capture_time = time.perf_counter() - start_time
 
-            # If there are no actions left in the queue, the observation must go through processing!
+            # Mark observation as must_go if:
+            # 1. Queue is fully empty (original behavior), OR
+            # 2. Queue is critically low (< 5 actions) — bypasses the observations_similar
+            #    filter on the server, which would otherwise block inference when the arm
+            #    is nearly stationary near the target (causing the "stuck looping" bug).
             with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
+                is_empty = self.action_queue.empty()
+                is_critically_low = current_queue_size < 5 and current_queue_size > 0
+
+            observation.must_go = self.must_go.is_set() and (is_empty or is_critically_low)
 
             _ = self.send_observation(observation)
 
-            self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
+            self.logger.info(
+                f"[DIAG] Sent obs #{observation.get_timestep()} | "
+                f"must_go={observation.must_go} | "
+                f"queue={current_queue_size} | "
+                f"empty={is_empty} | critically_low={is_critically_low} | "
+                f"must_go_event={self.must_go.is_set()}"
+            )
             if observation.must_go:
                 # must-go event will be set again after receiving actions
                 self.must_go.clear()
@@ -464,8 +569,47 @@ class RobotClient:
         _performed_action = None
         _captured_observation = None
 
+        # Diagnostics: track repeated timestep execution
+        _last_logged_step = -1
+        _repeated_step_count = 0
+        _last_queue_refill_step = -1
+        _no_action_streak = 0
+
         while self.running:
             control_loop_start = time.perf_counter()
+
+            with self.latest_action_lock:
+                current_latest = self.latest_action
+            with self.action_queue_lock:
+                current_qsize = self.action_queue.qsize()
+
+            # Detect stuck-in-loop: same timestep executing many times
+            if current_latest == _last_logged_step and current_latest >= 0:
+                _repeated_step_count += 1
+                if _repeated_step_count == 10:
+                    self.logger.warning(
+                        f"[DIAG] STUCK: latest_action=#{current_latest} has not advanced for 10+ steps | "
+                        f"queue_size={current_qsize} | "
+                        f"pending_obs={getattr(self, '_pending_observations', False)} | "
+                        f"must_go={self.must_go.is_set()} | "
+                        f"last_refill_at_step={_last_queue_refill_step}"
+                    )
+            else:
+                _repeated_step_count = 0
+                _last_logged_step = current_latest
+
+            # Detect no-action streak (queue empty, robot frozen)
+            if not self.actions_available():
+                _no_action_streak += 1
+                if _no_action_streak == 10:
+                    self.logger.warning(
+                        f"[DIAG] FROZEN: action queue empty for 10+ steps at latest_action=#{current_latest} | "
+                        f"pending_obs={getattr(self, '_pending_observations', False)} | "
+                        f"must_go={self.must_go.is_set()}"
+                    )
+            else:
+                _no_action_streak = 0
+
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
@@ -503,6 +647,9 @@ def async_client(cfg: RobotClientConfig):
         try:
             # The main thread runs the control loop
             client.control_loop(task=cfg.task)
+            
+        except KeyboardInterrupt:
+            client.logger.info("Interrupted by user")
 
         finally:
             client.stop()

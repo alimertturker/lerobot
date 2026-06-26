@@ -147,6 +147,10 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    
+    return_to_initial_position: bool = field(
+        default=True, metadata={"help": "Whether to return the robot to its initial position on shutdown"}
+    )
 
     @property
     def environment_dt(self) -> float:
