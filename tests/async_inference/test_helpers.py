@@ -180,7 +180,7 @@ def test_timed_data_deserialization_data_getters():
 
 
 # ---------------------------------------------------------------------
-# JPEG compression helpers (Phase 1 — async inference RTT reduction)
+# Image compression helpers (async inference RTT reduction)
 # ---------------------------------------------------------------------
 
 
@@ -197,13 +197,13 @@ def test_is_camera_frame_detects_hwc_uint8_arrays():
     assert not is_camera_frame(b"already bytes")
 
 
-def test_compress_decompress_image_round_trip_shape_and_content():
+def test_compress_decompress_image_jpeg_round_trip_shape_and_content():
     """JPEG round-trip must preserve shape and be visually close to the original
     (lossy, so compare with tolerance rather than exact equality)."""
     original = np.zeros((480, 640, 3), dtype=np.uint8)
     original[100:300, 200:400, :] = 255  # solid white block on black background
 
-    encoded = compress_image(original)
+    encoded = compress_image(original, codec="jpeg")
     assert isinstance(encoded, bytes)
     assert len(encoded) < original.nbytes  # actually compressed
 
@@ -215,6 +215,37 @@ def test_compress_decompress_image_round_trip_shape_and_content():
     # contrast must remain unmistakable.
     assert np.abs(decoded.astype(int) - original.astype(int)).mean() < 5.0
     assert decoded[200, 300].mean() > decoded[10, 10].mean()
+
+
+def test_compress_decompress_image_png_is_lossless():
+    """PNG round-trip must reproduce the frame bit-for-bit (lossless codec for
+    artifact-sensitive policies like ACT), while still shrinking the payload."""
+    rng = np.random.default_rng(0)
+    original = rng.integers(0, 256, size=(480, 640, 3), dtype=np.uint8)
+
+    encoded = compress_image(original, codec="png")
+    decoded = decompress_image(encoded)
+
+    assert decoded.shape == original.shape
+    assert decoded.dtype == np.uint8
+    assert np.array_equal(decoded, original)  # bit-exact
+
+
+def test_compress_image_preserves_channel_order_no_rgb_bgr_swap():
+    """cv2 imencode/imdecode are inverse ops, so a red-dominant pixel must stay
+    red-dominant through the round trip (guards against an RGB<->BGR swap)."""
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    frame[:, :, 0] = 240  # channel 0 (R under RGB convention) dominant
+
+    for codec in ("jpeg", "png"):
+        decoded = decompress_image(compress_image(frame, codec=codec))
+        assert decoded[4, 4, 0] > decoded[4, 4, 2], f"channel order swapped for codec={codec}"
+
+
+def test_compress_image_rejects_unknown_codec():
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="Unknown image codec"):
+        compress_image(frame, codec="webp")
 
 
 def test_compressed_observation_survives_pickle_round_trip():

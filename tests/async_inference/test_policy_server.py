@@ -171,14 +171,16 @@ def test_maybe_enqueue_observation_is_skipped(policy_server):
     assert policy_server.observation_queue.empty() is True
 
 
-def test_decompress_observation_decodes_compressed_camera_frames(policy_server):
-    """`_decompress_observation` must replace JPEG bytes with HWC uint8 arrays
-    in place, only when `compressed_images` is set."""
+@pytest.mark.parametrize("codec", ["jpeg", "png"])
+def test_decompress_observation_decodes_compressed_camera_frames(policy_server, codec):
+    """`_decompress_observation` must replace encoded bytes with HWC uint8 arrays
+    in place (for either codec — the server auto-detects), only when
+    `compressed_images` is set."""
     from lerobot.async_inference.helpers import TimedObservation, compress_image
 
     frame = np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8)
     obs = TimedObservation(
-        observation={"wrist": compress_image(frame), "shoulder_pan.pos": 0.5},
+        observation={"wrist": compress_image(frame, codec=codec), "shoulder_pan.pos": 0.5},
         timestamp=time.time(),
         timestep=0,
         compressed_images=True,
@@ -190,6 +192,8 @@ def test_decompress_observation_decodes_compressed_camera_frames(policy_server):
     assert isinstance(decoded, np.ndarray)
     assert decoded.shape == frame.shape
     assert decoded.dtype == np.uint8
+    if codec == "png":
+        assert np.array_equal(decoded, frame)  # lossless
     assert obs.get_observation()["shoulder_pan.pos"] == 0.5  # untouched
 
 

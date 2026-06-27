@@ -143,11 +143,23 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
+    # Observation image compression (opt-in). "none" sends raw uint8 frames (lossless,
+    # original behavior); "jpeg" is lossy but smallest; "png" is lossless and smaller
+    # than raw. Lossy JPEG can shift the input distribution for policies that normalize
+    # images with dataset stats (e.g. ACT), so it defaults off.
+    obs_image_codec: str = field(
+        default="none",
+        metadata={"help": "Codec for camera frames sent to the server. Options: none, jpeg, png"},
+    )
+    obs_jpeg_quality: int = field(
+        default=95, metadata={"help": "JPEG quality (1-100), used only when obs_image_codec=jpeg"}
+    )
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
-    
+
     return_to_initial_position: bool = field(
         default=True, metadata={"help": "Whether to return the robot to its initial position on shutdown"}
     )
@@ -183,6 +195,14 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.obs_image_codec not in ("none", "jpeg", "png"):
+            raise ValueError(
+                f"obs_image_codec must be one of 'none', 'jpeg', 'png', got {self.obs_image_codec!r}"
+            )
+
+        if not 1 <= self.obs_jpeg_quality <= 100:
+            raise ValueError(f"obs_jpeg_quality must be in [1, 100], got {self.obs_jpeg_quality}")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -204,4 +224,6 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "obs_image_codec": self.obs_image_codec,
+            "obs_jpeg_quality": self.obs_jpeg_quality,
         }

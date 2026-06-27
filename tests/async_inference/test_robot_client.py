@@ -68,6 +68,53 @@ def robot_client():
 
 
 # -----------------------------------------------------------------------------
+# RobotClientConfig validation (observation image codec)
+# -----------------------------------------------------------------------------
+
+
+def _base_config_kwargs():
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    return {
+        "robot": MockRobotConfig(),
+        "server_address": "localhost:9999",
+        "policy_type": "test",
+        "pretrained_name_or_path": "test",
+        "actions_per_chunk": 20,
+    }
+
+
+def test_obs_image_codec_defaults_to_none():
+    """Compression is opt-in: the default keeps raw lossless frames."""
+    from lerobot.async_inference.configs import RobotClientConfig
+
+    cfg = RobotClientConfig(**_base_config_kwargs())
+    assert cfg.obs_image_codec == "none"
+
+
+@pytest.mark.parametrize("codec", ["none", "jpeg", "png"])
+def test_obs_image_codec_accepts_known_codecs(codec):
+    from lerobot.async_inference.configs import RobotClientConfig
+
+    cfg = RobotClientConfig(obs_image_codec=codec, **_base_config_kwargs())
+    assert cfg.obs_image_codec == codec
+
+
+def test_obs_image_codec_rejects_unknown():
+    from lerobot.async_inference.configs import RobotClientConfig
+
+    with pytest.raises(ValueError, match="obs_image_codec"):
+        RobotClientConfig(obs_image_codec="webp", **_base_config_kwargs())
+
+
+def test_obs_jpeg_quality_out_of_range_rejected():
+    from lerobot.async_inference.configs import RobotClientConfig
+
+    with pytest.raises(ValueError, match="obs_jpeg_quality"):
+        RobotClientConfig(obs_jpeg_quality=0, **_base_config_kwargs())
+
+
+# -----------------------------------------------------------------------------
 # Helper utilities for tests
 # -----------------------------------------------------------------------------
 

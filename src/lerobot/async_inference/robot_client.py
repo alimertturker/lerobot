@@ -512,15 +512,23 @@ class RobotClient:
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
-            compressed_observation = {
-                k: compress_image(v) if is_camera_frame(v) else v for k, v in raw_observation.items()
-            }
+            # Optionally compress camera frames to reduce observation payload / RTT.
+            # Off by default ("none") to keep raw lossless frames, since lossy JPEG can
+            # degrade policies that normalize images with dataset stats (e.g. ACT).
+            codec = self.config.obs_image_codec
+            if codec != "none":
+                observation_payload = {
+                    k: compress_image(v, codec, self.config.obs_jpeg_quality) if is_camera_frame(v) else v
+                    for k, v in raw_observation.items()
+                }
+            else:
+                observation_payload = raw_observation
 
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
-                observation=compressed_observation,
+                observation=observation_payload,
                 timestep=max(latest_action, 0),
-                compressed_images=True,
+                compressed_images=codec != "none",
             )
 
             obs_capture_time = time.perf_counter() - start_time

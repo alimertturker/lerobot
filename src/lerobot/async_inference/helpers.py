@@ -82,19 +82,35 @@ def is_camera_frame(value: Any) -> bool:
     return isinstance(value, np.ndarray) and value.dtype == np.uint8 and value.ndim == 3
 
 
-def compress_image(frame: np.ndarray, quality: int = 85) -> bytes:
-    """JPEG-encode an HWC uint8 camera frame for transport."""
-    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+def compress_image(frame: np.ndarray, codec: str = "jpeg", quality: int = 95) -> bytes:
+    """Encode an HWC uint8 camera frame for transport.
+
+    codec="jpeg" is lossy (smaller, `quality` in 1-100); codec="png" is lossless.
+    Channel order round-trips through `decompress_image` unchanged (cv2 imencode/imdecode
+    are inverse ops), so no RGB<->BGR conversion is needed.
+    """
+    if codec == "jpeg":
+        ext, params = ".jpg", [cv2.IMWRITE_JPEG_QUALITY, quality]
+    elif codec == "png":
+        ext, params = ".png", []
+    else:
+        raise ValueError(f"Unknown image codec {codec!r}, expected 'jpeg' or 'png'")
+
+    ok, encoded = cv2.imencode(ext, frame, params)
     if not ok:
-        raise ValueError("Failed to JPEG-encode camera frame")
+        raise ValueError(f"Failed to {codec}-encode camera frame")
     return encoded.tobytes()
 
 
 def decompress_image(data: bytes) -> np.ndarray:
-    """Decode JPEG bytes back into an HWC uint8 camera frame."""
+    """Decode JPEG/PNG bytes back into an HWC uint8 camera frame.
+
+    cv2.imdecode auto-detects the format from the buffer header, so this handles
+    both codecs produced by `compress_image`.
+    """
     frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
-        raise ValueError("Failed to JPEG-decode camera frame")
+        raise ValueError("Failed to decode camera frame")
     return frame
 
 
