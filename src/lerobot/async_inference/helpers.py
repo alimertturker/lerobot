@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
 
 from lerobot.configs import PolicyFeature
@@ -69,6 +71,31 @@ def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
 
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
+
+
+def is_camera_frame(value: Any) -> bool:
+    """Heuristic for raw camera frames in a `RawObservation`: HWC uint8 arrays.
+
+    Raw observations use unprefixed robot key names (e.g. "wrist", "front"), so
+    camera entries can't be distinguished from motor entries by key alone.
+    """
+    return isinstance(value, np.ndarray) and value.dtype == np.uint8 and value.ndim == 3
+
+
+def compress_image(frame: np.ndarray, quality: int = 85) -> bytes:
+    """JPEG-encode an HWC uint8 camera frame for transport."""
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise ValueError("Failed to JPEG-encode camera frame")
+    return encoded.tobytes()
+
+
+def decompress_image(data: bytes) -> np.ndarray:
+    """Decode JPEG bytes back into an HWC uint8 camera frame."""
+    frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Failed to JPEG-decode camera frame")
+    return frame
 
 
 def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, int, int]) -> torch.tensor:
@@ -229,6 +256,7 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    compressed_images: bool = False
 
     def get_observation(self):
         return self.observation

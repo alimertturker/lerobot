@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 import torch
 
@@ -168,6 +169,43 @@ def test_maybe_enqueue_observation_is_skipped(policy_server):
 
     assert policy_server._enqueue_observation(new_obs) is False
     assert policy_server.observation_queue.empty() is True
+
+
+def test_decompress_observation_decodes_compressed_camera_frames(policy_server):
+    """`_decompress_observation` must replace JPEG bytes with HWC uint8 arrays
+    in place, only when `compressed_images` is set."""
+    from lerobot.async_inference.helpers import TimedObservation, compress_image
+
+    frame = np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8)
+    obs = TimedObservation(
+        observation={"wrist": compress_image(frame), "shoulder_pan.pos": 0.5},
+        timestamp=time.time(),
+        timestep=0,
+        compressed_images=True,
+    )
+
+    policy_server._decompress_observation(obs)
+
+    decoded = obs.get_observation()["wrist"]
+    assert isinstance(decoded, np.ndarray)
+    assert decoded.shape == frame.shape
+    assert decoded.dtype == np.uint8
+    assert obs.get_observation()["shoulder_pan.pos"] == 0.5  # untouched
+
+
+def test_decompress_observation_is_noop_when_not_compressed(policy_server):
+    """Uncompressed observations (compressed_images=False, the default) must
+    pass through `_decompress_observation` unchanged — backward compatibility
+    with clients that don't JPEG-compress frames."""
+    from lerobot.async_inference.helpers import TimedObservation
+
+    raw_obs = {"shoulder_pan.pos": 0.5}
+    obs = TimedObservation(observation=raw_obs, timestamp=time.time(), timestep=0)
+
+    policy_server._decompress_observation(obs)
+
+    assert obs.get_observation() is raw_obs
+    assert obs.get_observation() == {"shoulder_pan.pos": 0.5}
 
 
 def test_obs_sanity_checks(policy_server):

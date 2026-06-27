@@ -27,6 +27,9 @@ from lerobot.async_inference.helpers import (  # noqa: E402
     FPSTracker,
     TimedAction,
     TimedObservation,
+    compress_image,
+    decompress_image,
+    is_camera_frame,
     observations_similar,
     prepare_image,
     prepare_raw_observation,
@@ -128,6 +131,13 @@ def test_timed_observation_getters():
     assert to.get_timestep() == 0
 
 
+def test_timed_observation_compressed_images_defaults_false():
+    """`compressed_images` must default to False, so old pickled clients/servers
+    (or callers that never set it, like the existing test fixtures) keep working."""
+    to = TimedObservation(timestamp=time.time(), observation={}, timestep=0)
+    assert to.compressed_images is False
+
+
 def test_timed_data_deserialization_data_getters():
     """TimedAction / TimedObservation survive a round-trip through ``pickle``.
 
@@ -167,6 +177,63 @@ def test_timed_data_deserialization_data_getters():
     assert to_out.must_go is True
     assert to_out.get_observation().keys() == obs_dict.keys()
     torch.testing.assert_close(to_out.get_observation()[OBS_STATE], obs_dict[OBS_STATE])
+
+
+# ---------------------------------------------------------------------
+# JPEG compression helpers (Phase 1 — async inference RTT reduction)
+# ---------------------------------------------------------------------
+
+
+def test_is_camera_frame_detects_hwc_uint8_arrays():
+    """Camera frames are HWC uint8 ndarrays; everything else in a raw
+    observation (motor floats, already-resolved state vectors) must not match."""
+    camera_frame = np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8)
+    assert is_camera_frame(camera_frame)
+
+    assert not is_camera_frame(1.23)  # motor position
+    assert not is_camera_frame("pick up the cube")  # task string
+    assert not is_camera_frame(np.zeros((6,), dtype=np.float32))  # 1D state vector
+    assert not is_camera_frame(np.zeros((480, 640, 3), dtype=np.float32))  # wrong dtype
+    assert not is_camera_frame(b"already bytes")
+
+
+def test_compress_decompress_image_round_trip_shape_and_content():
+    """JPEG round-trip must preserve shape and be visually close to the original
+    (lossy, so compare with tolerance rather than exact equality)."""
+    original = np.zeros((480, 640, 3), dtype=np.uint8)
+    original[100:300, 200:400, :] = 255  # solid white block on black background
+
+    encoded = compress_image(original)
+    assert isinstance(encoded, bytes)
+    assert len(encoded) < original.nbytes  # actually compressed
+
+    decoded = decompress_image(encoded)
+    assert decoded.shape == original.shape
+    assert decoded.dtype == np.uint8
+
+    # JPEG is lossy: allow small per-pixel error, but the block/background
+    # contrast must remain unmistakable.
+    assert np.abs(decoded.astype(int) - original.astype(int)).mean() < 5.0
+    assert decoded[200, 300].mean() > decoded[10, 10].mean()
+
+
+def test_compressed_observation_survives_pickle_round_trip():
+    """A TimedObservation holding JPEG bytes (as produced by robot_client.py)
+    must still pickle/unpickle cleanly, matching the gRPC transport path."""
+    frame = np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8)
+    compressed = {"wrist": compress_image(frame), "shoulder_pan.pos": 0.5, "task": "grab"}
+
+    obs_in = TimedObservation(
+        timestamp=time.time(), observation=compressed, timestep=3, compressed_images=True
+    )
+    obs_bytes = pickle.dumps(obs_in)  # nosec
+    obs_out: TimedObservation = pickle.loads(obs_bytes)  # nosec B301
+
+    assert obs_out.compressed_images is True
+    assert isinstance(obs_out.get_observation()["wrist"], bytes)
+
+    decoded = decompress_image(obs_out.get_observation()["wrist"])
+    assert decoded.shape == frame.shape
 
 
 # ---------------------------------------------------------------------

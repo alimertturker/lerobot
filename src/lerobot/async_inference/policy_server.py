@@ -55,6 +55,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    decompress_image,
     get_logger,
     observations_similar,
     raw_observation_to_observation,
@@ -181,6 +182,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
+        self._decompress_observation(timed_observation)
         deserialize_time = time.perf_counter() - start_deserialize
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
@@ -264,6 +266,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.error(f"Error in StreamActions: {e}")
 
             return services_pb2.Empty()
+
+    def _decompress_observation(self, timed_observation: TimedObservation) -> None:
+        """Decode JPEG-compressed camera frames back to HWC uint8 arrays, in place."""
+        if not timed_observation.compressed_images:
+            return
+
+        observation = timed_observation.get_observation()
+        for key, value in observation.items():
+            if isinstance(value, bytes):
+                observation[key] = decompress_image(value)
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
         """Check if the observation is valid to be processed by the policy"""

@@ -74,7 +74,9 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    compress_image,
     get_logger,
+    is_camera_frame,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
@@ -94,11 +96,13 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
-        
+
         # Store the initial position for teardown
         initial_obs = self.robot.get_observation()
         if initial_obs:
-            self.initial_position = {k: v for k, v in initial_obs.items() if isinstance(k, str) and k.endswith(".pos")}
+            self.initial_position = {
+                k: v for k, v in initial_obs.items() if isinstance(k, str) and k.endswith(".pos")
+            }
         else:
             self.initial_position = None
 
@@ -182,7 +186,7 @@ class RobotClient:
         target = getattr(self, "initial_position", None)
         if not target:
             return
-            
+
         try:
             current_obs = self.robot.get_observation()
             current_pos = {k: v for k, v in current_obs.items() if k in target}
@@ -204,7 +208,7 @@ class RobotClient:
         if getattr(self.config, "return_to_initial_position", True):
             self.logger.info("Returning robot to initial position before shutdown...")
             self._return_to_initial_position()
-            
+
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
@@ -268,21 +272,21 @@ class RobotClient:
             internal_queue = self.action_queue.queue
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
-        
+
         with self.latest_action_lock:
             latest_action = self.latest_action
 
         # Keep actions that are not overwritten by incoming actions
         incoming_timesteps = {a.get_timestep() for a in incoming_actions}
-        
+
         # Prepare a dictionary of final actions to easily sort them later
         final_actions = {}
-        
+
         # First, preserve existing future actions
         for action in internal_queue:
             if action.get_timestep() > latest_action:
                 final_actions[action.get_timestep()] = action
-                
+
         # Now process incoming actions
         for new_action in incoming_actions:
             # New action is older than the latest action in the queue, skip it
@@ -299,12 +303,10 @@ class RobotClient:
             aggregated_action = TimedAction(
                 timestamp=new_action.get_timestamp(),
                 timestep=new_action.get_timestep(),
-                action=aggregate_fn(
-                    current_action_queue[new_action.get_timestep()], new_action.get_action()
-                ),
+                action=aggregate_fn(current_action_queue[new_action.get_timestep()], new_action.get_action()),
             )
             final_actions[new_action.get_timestep()] = aggregated_action
-            
+
         # Put the sorted final actions into the queue
         for ts in sorted(final_actions.keys()):
             future_action_queue.put(final_actions[ts])
@@ -472,29 +474,31 @@ class RobotClient:
             if self.action_chunk_size <= 0:
                 is_below_threshold = True
             else:
-                is_below_threshold = self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
-                
+                is_below_threshold = (
+                    self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+                )
+
             if not is_below_threshold:
                 self._pending_observations = False
                 return False
-                
+
             # If below threshold, ensure we don't saturate the network while waiting for the inference server
             now = time.time()
             if not hasattr(self, "_last_obs_send_time"):
                 self._last_obs_send_time = 0
-                
+
             # Avoid sending multiple observations when one is already actively being processed by the server
             if getattr(self, "_pending_observations", False):
                 # Only timeout and send another if the server has taken longer than 2.0 seconds (e.g. dropped obs)
                 if now - self._last_obs_send_time < 2.0:
                     return False
-                
+
             # A dynamic or static cooldown (e.g. 0.1s or 0.2s) prevents sending 30 observations per second
             if now - self._last_obs_send_time >= 0.1:
                 self._last_obs_send_time = now
                 self._pending_observations = True
                 return True
-                
+
             return False
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
@@ -508,10 +512,15 @@ class RobotClient:
             with self.latest_action_lock:
                 latest_action = self.latest_action
 
+            compressed_observation = {
+                k: compress_image(v) if is_camera_frame(v) else v for k, v in raw_observation.items()
+            }
+
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
-                observation=raw_observation,
+                observation=compressed_observation,
                 timestep=max(latest_action, 0),
+                compressed_images=True,
             )
 
             obs_capture_time = time.perf_counter() - start_time
@@ -647,7 +656,7 @@ def async_client(cfg: RobotClientConfig):
         try:
             # The main thread runs the control loop
             client.control_loop(task=cfg.task)
-            
+
         except KeyboardInterrupt:
             client.logger.info("Interrupted by user")
 
