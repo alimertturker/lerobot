@@ -473,9 +473,9 @@ To setup the gamepad, you need to set the `control_mode` to `"gamepad"` and defi
 
 **Setting up the SO101 leader**
 
-The SO101 leader arm has reduced gears that allows it to move and track the follower arm during exploration. Therefore, taking over is much smoother than the gearless SO100.
+The SO101 leader arm has reduced gears and motors that can drive it, so it can be moved onto the follower's pose before you take over. Therefore, taking over is much smoother than the gearless SO100.
 
-To setup the SO101 leader, you need to set the `control_mode` to `"leader"` and define the `teleop` section in the configuration file.
+To setup the SO101 leader, set `control_mode` to `"leader"`, define the `teleop` section, and configure `inverse_kinematics`. The policy acts in end-effector delta space, so the leader's moves are recorded as `[delta_x, delta_y, delta_z, gripper]` actions computed with the follower's kinematics.
 
 ```json
 {
@@ -483,20 +483,45 @@ To setup the SO101 leader, you need to set the `control_mode` to `"leader"` and 
     "teleop": {
       "type": "so101_leader",
       "port": "/dev/tty.usbmodem585A0077921",
+      "id": "leader",
       "use_degrees": true
     },
     "processor": {
       "control_mode": "leader",
       "gripper": {
         "use_gripper": true
+      },
+      "inverse_kinematics": {
+        "urdf_path": "path/to/so101_new_calib.urdf",
+        "target_frame_name": "gripper_frame_link",
+        "end_effector_bounds": {
+          "min": [0.1, -0.2, 0.0],
+          "max": [0.35, 0.2, 0.25]
+        },
+        "end_effector_step_sizes": { "x": 0.02, "y": 0.02, "z": 0.02 }
+      },
+      "reset": {
+        "fixed_reset_joint_positions": [0.0, -10.0, 10.0, 90.0, 0.0, 50.0],
+        "home_joint_positions": [0.0, -100.0, 100.0, 75.0, 0.0, 0.0]
+      },
+      "leader_intervention": {
+        "pause_key": "space",
+        "correction_key": "tab",
+        "max_joint_speed": 90.0
       }
     }
   }
 }
 ```
 
-In order to annotate the success/failure of the episode, **you will need** to use a keyboard to press `s` for success, `esc` for failure.
-During the online training, press `space` to take over the policy and `space` again to give the control back to the policy.
+How interventions work with the leader arm (the same two-step handover as the DAgger rollout strategy):
+
+- While the policy is in control, the leader rests at `home_joint_positions` with its torque off.
+- Press **`space`** to pause: the follower holds still and the leader is driven onto the follower's pose, where it holds with torque.
+- With your hand on the leader, press **`tab`** to take over: the leader's torque is released and the follower copies it joint-to-joint, at most `max_joint_speed` per joint. Each step is recorded as the end-effector delta of the commanded move, divided by `end_effector_step_sizes` and clipped to [-1, 1], so make the step sizes large enough for your hand speed (`step_size * fps` metres per second).
+- Press **`tab`** again to make the leader hold where it is, then **`space`** to park the leader and resume the policy.
+
+The leader is only released while you hold it, so it cannot fall and drag the follower with it. The keys switch modes and end episodes (`s` for success, `q` or `esc` for failure, `r` to re-record); all motion comes from the leader. On exit, the leader and then the follower move to `home_joint_positions`. On macOS, give your terminal the Input Monitoring permission, or keep the terminal focused so keys are read from it.
 
 <details>
 <summary><strong>Video: SO101 leader teleoperation</strong></summary>
@@ -510,7 +535,7 @@ During the online training, press `space` to take over the policy and `space` ag
   </video>
 </div>
 
-<p align="center"><i>SO101 leader teleoperation example, the leader tracks the follower, press `space` to intervene</i></p>
+<p align="center"><i>SO101 leader teleoperation example</i></p>
 </details>
 
 **Recording Demonstrations**

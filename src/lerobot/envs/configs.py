@@ -283,9 +283,44 @@ class ResetConfig:
     """Configuration for environment reset behavior."""
 
     fixed_reset_joint_positions: list[float] | None = None
+    # Joint positions the follower (and an actuated leader) move to when the script exits.
+    home_joint_positions: list[float] | None = None
     reset_time_s: float = 5.0
+    # Seconds the follower holds still after an episode ends, before moving to the reset pose (e.g. to take
+    # a grasped object out of the gripper).
+    release_wait_s: float = 0.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
+
+
+@dataclass
+class LeaderInterventionConfig:
+    """Configuration for human interventions with an actuated leader arm (`control_mode: "leader"`).
+
+    Interventions are switched with keys, as in the DAgger rollout strategy. While the policy runs the
+    leader is parked. `pause_key` pauses the policy, holds the follower still and drives the leader onto the
+    follower's pose; with a hand on the leader, `correction_key` releases its torque so the follower copies
+    it; `correction_key` again holds the leader, and `pause_key` resumes the policy. Joint values are in the
+    leader's normalized units (degrees with `use_degrees=True`).
+    """
+
+    # Pause / resume the policy (the leader moves onto the follower on pause).
+    pause_key: str = "space"
+    # Start / stop a correction (the leader's torque is released while correcting).
+    correction_key: str = "tab"
+    # Duration of the smooth move that brings the leader onto the follower when pausing.
+    handover_duration_s: float = 1.5
+    # Maximum follower joint speed while it copies the leader, in joint units per second.
+    max_joint_speed: float = 90.0
+    # Gripper difference (leader - follower) below which the recorded gripper action is "stay".
+    gripper_threshold: float = 3.0
+    # Start every episode paused (leader already on the follower), so `correction_key` starts a
+    # demonstration right away. Useful when recording demonstrations without a policy.
+    start_paused: bool = False
+    # Keys that end the episode.
+    success_key: str = "s"
+    failure_keys: tuple[str, ...] = ("q", "esc")
+    rerecord_key: str = "r"
 
 
 @dataclass
@@ -300,6 +335,8 @@ class HILSerlProcessorConfig:
     inverse_kinematics: InverseKinematicsConfig | None = None
     reward_classifier: RewardClassifierConfig | None = None
     max_gripper_pos: float | None = 100.0
+    # Only used when `control_mode` is "leader".
+    leader_intervention: LeaderInterventionConfig | None = None
 
 
 @EnvConfig.register_subclass(name="gym_manipulator")

@@ -46,6 +46,7 @@ For more details on the complete HILSerl training workflow, see:
 https://github.com/michel-aractingi/lerobot-hilserl-guide
 """
 
+import atexit
 import logging
 import os
 import time
@@ -106,6 +107,7 @@ from lerobot.utils.utils import (
 from .algorithms.base import RLAlgorithm
 from .algorithms.factory import make_algorithm
 from .gym_manipulator import (
+    close_env_and_processors,
     make_processors,
     make_robot_env,
     reset_and_build_transition,
@@ -259,6 +261,8 @@ def act_with_policy(
 
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
     env_processor, action_processor = make_processors(online_env, teleop_device, cfg.env, cfg.policy.device)
+    # Send the robot (and an actuated leader) to the home pose and disconnect when the actor exits.
+    atexit.register(close_env_and_processors, online_env, env_processor, action_processor)
 
     set_seed(cfg.seed)
     device = get_safe_torch_device(cfg.policy.device, log=True)

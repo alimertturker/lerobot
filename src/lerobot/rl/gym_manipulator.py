@@ -27,6 +27,7 @@ from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.datasets import LeRobotDataset
 from lerobot.envs import HILSerlRobotEnvConfig
+from lerobot.envs.configs import LeaderInterventionConfig
 from lerobot.model import RobotKinematics
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -42,6 +43,7 @@ from lerobot.processor import (
     MapDeltaActionToRobotActionStep,
     MapTensorToDeltaActionDictStep,
     Numpy2TorchActionProcessorStep,
+    ProcessorStep,
     RewardClassifierProcessorStep,
     RobotActionToPolicyActionProcessorStep,
     RobotObservation,
@@ -76,9 +78,15 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.import_utils import require_package
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import log_say
+from lerobot.utils.utils import init_logging, log_say
 
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from .leader_intervention import (
+    LEADER_PHASE_KEY,
+    LeaderArmInterventionStep,
+    LeaderJointActionOverrideStep,
+    LeaderPhase,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -105,15 +113,21 @@ class GymManipulatorConfig:
     device: str = "cpu"
 
 
-def reset_follower_position(robot_arm: Robot, target_position: np.ndarray) -> None:
-    """Reset robot arm to target position using smooth trajectory."""
+def reset_follower_position(
+    robot_arm: Robot, target_position: np.ndarray, max_joint_speed: float = 60.0
+) -> None:
+    """Reset robot arm to target position using smooth trajectory.
+
+    The trajectory has at least 50 waypoints and enough of them to keep every joint under
+    `max_joint_speed` (position units per second, degrees for most arms).
+    """
     current_position_dict = robot_arm.bus.sync_read("Present_Position")
     current_position = np.array(
         [current_position_dict[name] for name in current_position_dict], dtype=np.float32
     )
-    trajectory = torch.from_numpy(
-        np.linspace(current_position, target_position, 50)
-    )  # NOTE: 30 is just an arbitrary number
+    max_distance = float(np.max(np.abs(np.asarray(target_position) - current_position)))
+    num_steps = max(50, int(np.ceil(max_distance / (max_joint_speed * 0.015))))
+    trajectory = torch.from_numpy(np.linspace(current_position, target_position, num_steps))
     for pose in trajectory:
         action_dict = dict(zip(current_position_dict, pose, strict=False))
         robot_arm.bus.sync_write("Goal_Position", action_dict)
@@ -130,6 +144,8 @@ class RobotEnv(gym.Env):
         display_cameras: bool = False,
         reset_pose: list[float] | None = None,
         reset_time_s: float = 5.0,
+        home_pose: list[float] | None = None,
+        release_wait_s: float = 0.0,
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -139,6 +155,8 @@ class RobotEnv(gym.Env):
             display_cameras: Whether to show camera feeds during execution.
             reset_pose: Joint positions for environment reset.
             reset_time_s: Time to wait during reset.
+            home_pose: Joint positions the robot moves to in `close`, before disconnecting.
+            release_wait_s: Time the robot holds still after an episode, before moving to `reset_pose`.
         """
         super().__init__()
 
@@ -158,6 +176,8 @@ class RobotEnv(gym.Env):
 
         self.reset_pose = reset_pose
         self.reset_time_s = reset_time_s
+        self.home_pose = home_pose
+        self.release_wait_s = release_wait_s
 
         self.use_gripper = use_gripper
 
@@ -235,10 +255,22 @@ class RobotEnv(gym.Env):
         """
         # Reset the robot
         # self.robot.reset()
+        if self.current_step > 0 and self.release_wait_s > 0:
+            logging.info(f"Holding for {self.release_wait_s:.1f}s before the reset")
+            precise_sleep(self.release_wait_s)
         start_time = time.perf_counter()
         if self.reset_pose is not None:
             log_say("Reset the environment.", play_sounds=True)
-            reset_follower_position(self.robot, np.array(self.reset_pose))
+            target = np.array(self.reset_pose, dtype=np.float32)
+            motors = list(self.robot.bus.motors)
+            if self.use_gripper and "gripper" in motors:
+                # Move the arm with the gripper still at its commanded position, then open it at the reset
+                # pose, so an object held at the end of the episode is put down there instead of thrown.
+                arm_first = target.copy()
+                gripper_goal = self.robot.bus.sync_read("Goal_Position")["gripper"]
+                arm_first[motors.index("gripper")] = gripper_goal
+                reset_follower_position(self.robot, arm_first)
+            reset_follower_position(self.robot, target)
             log_say("Reset the environment done.", play_sounds=True)
 
         precise_sleep(max(self.reset_time_s - (time.perf_counter() - start_time), 0.0))
@@ -292,8 +324,11 @@ class RobotEnv(gym.Env):
                 cv2.waitKey(1)
 
     def close(self) -> None:
-        """Close environment and disconnect robot."""
+        """Move the robot to `home_pose` (if set) and disconnect it."""
         if self.robot.is_connected:
+            if self.home_pose is not None:
+                logging.info("Moving the robot to its home pose")
+                reset_follower_position(self.robot, np.array(self.home_pose))
             self.robot.disconnect()
 
     def get_raw_joint_positions(self) -> dict[str, float]:
@@ -343,13 +378,15 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     display_cameras = (
         cfg.processor.observation.display_cameras if cfg.processor.observation is not None else False
     )
-    reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
-
+    reset_cfg = cfg.processor.reset
     env = RobotEnv(
         robot=robot,
         use_gripper=use_gripper,
         display_cameras=display_cameras,
-        reset_pose=reset_pose,
+        reset_pose=reset_cfg.fixed_reset_joint_positions if reset_cfg is not None else None,
+        reset_time_s=reset_cfg.reset_time_s if reset_cfg is not None else 5.0,
+        home_pose=reset_cfg.home_joint_positions if reset_cfg is not None else None,
+        release_wait_s=reset_cfg.release_wait_s if reset_cfg is not None else 0.0,
     )
 
     return env, teleop_device
@@ -483,11 +520,45 @@ def make_processors(
     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
-    action_pipeline_steps = [
+    use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
+    leader_mode = cfg.processor.control_mode == "leader"
+    if leader_mode:
+        if kinematics_solver is None or cfg.processor.inverse_kinematics is None:
+            raise ValueError(
+                'control_mode "leader" requires `processor.inverse_kinematics` (urdf_path, target_frame_name, '
+                "end_effector_step_sizes, end_effector_bounds): leader moves are recorded as end-effector deltas."
+            )
+        if (
+            cfg.processor.inverse_kinematics.end_effector_step_sizes is None
+            or cfg.processor.inverse_kinematics.end_effector_bounds is None
+        ):
+            raise ValueError(
+                'control_mode "leader" requires `inverse_kinematics.end_effector_step_sizes` and '
+                "`inverse_kinematics.end_effector_bounds` (find them with `lerobot-find-joint-limits`)."
+            )
+        if teleop_device is None:
+            raise ValueError('control_mode "leader" requires a `teleop` leader arm.')
+        home_pose = cfg.processor.reset.home_joint_positions if cfg.processor.reset is not None else None
+        teleop_events_step: ProcessorStep = LeaderArmInterventionStep(
+            teleop_device=teleop_device,
+            kinematics=kinematics_solver,
+            motor_names=motor_names,
+            end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+            use_gripper=use_gripper,
+            fps=cfg.fps,
+            config=cfg.processor.leader_intervention or LeaderInterventionConfig(),
+            home_pose=dict(zip([f"{m}.pos" for m in motor_names], home_pose, strict=True))
+            if home_pose is not None
+            else None,
+        )
+    else:
+        teleop_events_step = AddTeleopEventsAsInfoStep(teleop_device=teleop_device)
+
+    action_pipeline_steps: list[ProcessorStep] = [
         AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
-        AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+        teleop_events_step,
         InterventionActionProcessorStep(
-            use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+            use_gripper=use_gripper,
             terminate_on_success=terminate_on_success,
         ),
     ]
@@ -495,32 +566,40 @@ def make_processors(
     # Replace InverseKinematicsProcessor with new kinematic processors
     if cfg.processor.inverse_kinematics is not None and kinematics_solver is not None:
         # Add EE bounds and safety processor
+        ee_reference_step = EEReferenceAndDelta(
+            kinematics=kinematics_solver,
+            end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+            motor_names=motor_names,
+            use_latched_reference=False,
+            use_ik_solution=True,
+        )
+        ee_bounds_step = EEBoundsAndSafety(
+            end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+        )
+        ik_step = InverseKinematicsRLStep(
+            kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+        )
         inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(
-                use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
-            ),
+            MapTensorToDeltaActionDictStep(use_gripper=use_gripper),
             MapDeltaActionToRobotActionStep(),
-            EEReferenceAndDelta(
-                kinematics=kinematics_solver,
-                end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
-                motor_names=motor_names,
-                use_latched_reference=False,
-                use_ik_solution=True,
-            ),
-            EEBoundsAndSafety(
-                end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
-            ),
+            ee_reference_step,
+            ee_bounds_step,
             GripperVelocityToJoint(
                 clip_max=cfg.processor.max_gripper_pos,
                 speed_factor=1.0,
                 discrete_gripper=True,
             ),
-            InverseKinematicsRLStep(
-                kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
-            ),
+            ik_step,
         ]
         action_pipeline_steps.extend(inverse_kinematics_steps)
         action_pipeline_steps.append(RobotActionToPolicyActionProcessorStep(motor_names=motor_names))
+        if leader_mode:
+            # During an intervention the follower copies the leader joint-to-joint instead of the IK target.
+            action_pipeline_steps.append(
+                LeaderJointActionOverrideStep(
+                    motor_names=motor_names, steps_to_reset=[ee_reference_step, ee_bounds_step, ik_step]
+                )
+            )
 
     return DataProcessorPipeline(
         steps=env_pipeline_steps, to_transition=identity_transition, to_output=identity_transition
@@ -571,11 +650,11 @@ def step_env_and_process_transition(
             complementary_data["raw_joint_positions"] = raw_joint_positions
 
     # Merge env and action-processor info: env wins for str keys, action-processor
-    # wins for `TeleopEvents` enum keys
+    # wins for `TeleopEvents` enum keys and the leader intervention phase
     action_info = processed_action_transition[TransitionKey.INFO]
     new_info = info.copy()
     for key, value in action_info.items():
-        if isinstance(key, TeleopEvents):
+        if isinstance(key, TeleopEvents) or key == LEADER_PHASE_KEY:
             new_info[key] = value
 
     new_transition = create_transition(
@@ -597,10 +676,14 @@ def reset_and_build_transition(
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
 ) -> EnvTransition:
-    """Reset env + processors and return the first env-processed transition."""
-    obs, info = env.reset()
+    """Reset env + processors and return the first env-processed transition.
+
+    Processors are reset first so that stateful steps holding hardware (e.g. a leader arm released during
+    an intervention) are made safe before the environment moves the robot to its reset pose.
+    """
     env_processor.reset()
     action_processor.reset()
+    obs, info = env.reset()
     complementary_data: dict[str, Any] = {}
     if hasattr(env, "get_raw_joint_positions"):
         raw_joint_positions = env.get_raw_joint_positions()
@@ -631,7 +714,20 @@ def control_loop(
 
     print(f"Starting control loop at {cfg.env.fps} FPS")
     print("Controls:")
-    print("- Use gamepad/teleop device for intervention")
+    if cfg.env.processor.control_mode == "leader":
+        keys = cfg.env.processor.leader_intervention or LeaderInterventionConfig()
+        print(f"- '{keys.pause_key}': pause (the leader moves onto the follower and holds)")
+        print(f"- '{keys.correction_key}': with a hand on the leader, take over / hold again")
+        print(f"- '{keys.pause_key}' again (after holding): resume the policy")
+        print(
+            f"- '{keys.success_key}' success, {'/'.join(keys.failure_keys)} failure, '{keys.rerecord_key}' re-record"
+        )
+        if keys.start_paused:
+            print("- Each episode starts paused with the leader on the follower")
+        if cfg.mode == "record":
+            print(f"- Recording starts at the first '{keys.correction_key}' of each episode")
+    else:
+        print("- Use gamepad/teleop device for intervention")
     print("- When not intervening, robot will stay still")
     print("- Press Ctrl+C to exit")
 
@@ -642,13 +738,15 @@ def control_loop(
 
     dataset = None
     if cfg.mode == "record":
-        if teleop_device:
+        if teleop_device and cfg.env.processor.control_mode != "leader":
             action_features = teleop_device.action_features
         else:
+            # Leader-arm interventions are recorded in the policy's end-effector delta action space.
+            names = ["delta_x", "delta_y", "delta_z"] + (["gripper"] if use_gripper else [])
             action_features = {
                 "dtype": "float32",
-                "shape": (4,),
-                "names": ["delta_x", "delta_y", "delta_z", "gripper"],
+                "shape": (len(names),),
+                "names": names,
             }
         features = {
             ACTION: action_features,
@@ -687,8 +785,12 @@ def control_loop(
             features=features,
         )
 
+    # With a leader arm, an episode is recorded from the first take-over on, so the wait before the
+    # demonstration starts is not stored as "do nothing" steps.
+    record_from_takeover = cfg.env.processor.control_mode == "leader"
     episode_idx = 0
     episode_step = 0
+    episode_frames = 0
     episode_start_time = time.perf_counter()
 
     try:
@@ -716,7 +818,11 @@ def control_loop(
             terminated = transition.get(TransitionKey.DONE, False)
             truncated = transition.get(TransitionKey.TRUNCATED, False)
 
-            if cfg.mode == "record":
+            info = transition.get(TransitionKey.INFO) or {}
+            recording = not record_from_takeover or episode_frames > 0
+            recording = recording or info.get(LEADER_PHASE_KEY) == LeaderPhase.CORRECTING.value
+
+            if cfg.mode == "record" and recording:
                 action_to_record = transition[TransitionKey.COMPLEMENTARY_DATA].get(
                     "teleop_action", transition[TransitionKey.ACTION]
                 )
@@ -737,6 +843,7 @@ def control_loop(
                 if dataset is not None:
                     frame["task"] = cfg.dataset.task
                     dataset.add_frame(frame)
+                    episode_frames += 1
 
             episode_step += 1
 
@@ -750,7 +857,11 @@ def control_loop(
                 episode_idx += 1
 
                 if dataset is not None:
-                    if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
+                    if episode_frames == 0:
+                        logging.info(f"Nothing recorded (no take-over), re-recording episode {episode_idx}")
+                        dataset.clear_episode_buffer()
+                        episode_idx -= 1
+                    elif transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
                         logging.info(f"Re-recording episode {episode_idx}")
                         dataset.clear_episode_buffer()
                         episode_idx -= 1
@@ -760,6 +871,8 @@ def control_loop(
 
                 # Reset for new episode
                 transition = reset_and_build_transition(env, env_processor, action_processor)
+                episode_start_time = time.perf_counter()
+                episode_frames = 0
 
             # Maintain fps timing
             precise_sleep(max(dt - (time.perf_counter() - step_start_time), 0.0))
@@ -767,12 +880,22 @@ def control_loop(
         if dataset is not None and dataset.writer is not None and dataset.writer.image_writer is not None:
             logging.info("Waiting for image writer to finish...")
             dataset.writer.image_writer.stop()
+        if dataset is not None:
+            # Write the parquet footers, also when the loop is interrupted (Ctrl+C).
+            dataset.finalize()
 
     if dataset is not None and cfg.dataset.push_to_hub:
-        logging.info("Finalizing dataset before pushing to hub")
-        dataset.finalize()
         logging.info("Pushing dataset to hub")
         dataset.push_to_hub()
+
+
+def close_env_and_processors(env: gym.Env, *pipelines: DataProcessorPipeline) -> None:
+    """Close the processor steps that hold hardware (e.g. an actuated leader arm), then the environment."""
+    for pipeline in pipelines:
+        for step in pipeline.steps:
+            if callable(close := getattr(step, "close", None)):
+                close()
+    env.close()
 
 
 def replay_trajectory(
@@ -805,6 +928,7 @@ def replay_trajectory(
 @parser.wrap()
 def main(cfg: GymManipulatorConfig) -> None:
     """Main entry point for gym manipulator script."""
+    init_logging()
     env, teleop_device = make_robot_env(cfg.env)
     env_processor, action_processor = make_processors(env, teleop_device, cfg.env, cfg.device)
 
@@ -813,11 +937,13 @@ def main(cfg: GymManipulatorConfig) -> None:
     print("Environment processor:", env_processor)
     print("Action processor:", action_processor)
 
-    if cfg.mode == "replay":
-        replay_trajectory(env, action_processor, cfg)
-        exit()
-
-    control_loop(env, env_processor, action_processor, teleop_device, cfg)
+    try:
+        if cfg.mode == "replay":
+            replay_trajectory(env, action_processor, cfg)
+        else:
+            control_loop(env, env_processor, action_processor, teleop_device, cfg)
+    finally:
+        close_env_and_processors(env, env_processor, action_processor)
 
 
 if __name__ == "__main__":
