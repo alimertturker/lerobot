@@ -1,0 +1,6 @@
+outputs/
+__pycache__/
+# Machine and setup settings (copy local.env.example)
+local.env
+# SO-101 URDF and meshes, downloaded by scripts/get_urdf.sh
+assets/
