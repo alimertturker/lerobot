@@ -52,6 +52,7 @@ so the JSON configs never need per-machine edits.
 | `RESET_POSE`                     | Joint pose every episode starts from (degrees); tip must be inside the box | hold the leader there, `scripts/read_pose.sh`                            |
 | `HOME_POSE`                      | Folded rest pose both arms go to on exit                                   | hold the leader there, `scripts/read_pose.sh`                            |
 | `LEARNER_DEVICE`, `ACTOR_DEVICE` | `cuda`, `mps` or `cpu`                                                     | `cuda` on NVIDIA; on Apple Silicon see _Device_ below                    |
+| `EC2_HOST`, `EC2_KEY`, `EC2_DIR` | Optional remote learner: `user@address`, SSH key, remote folder            | see [Remote learner](#remote-learner-on-a-gpu-machine-aws-ec2)           |
 
 Bounds and poses depend on where the robot, cameras and table are, so measure them on every new setup; the
 values in `local.env.example` are from the original setup and are only a starting point.
@@ -77,7 +78,24 @@ another machine's values.
 
 ## How control works
 
-Like the DAgger rollout strategy: keys only switch modes, all motion comes from the leader.
+Keys only switch modes; all motion comes from the leader. There are two modes, set by
+`processor.leader_intervention.follow_follower`.
+
+**Training and testing (`follow_follower: true`, one key).** The leader follows the follower while the policy
+runs, so you can take over at any moment:
+
+| Key                   | From                           | What happens                                                            |
+| --------------------- | ------------------------------ | ----------------------------------------------------------------------- |
+| `space`               | policy running, **hand on it** | Leader torque off, the follower copies it at once (max 90°/s per joint) |
+| `space`               | correcting                     | Leader holds, rejoins the follower, policy continues from there         |
+| `s` / `q`,`esc` / `r` | any                            | Episode success / failure / re-record                                   |
+
+Hold the leader before pressing `space`: with torque off it falls if nobody holds it. At the start of each
+episode the leader moves onto the follower's reset pose (at 90°/s) before following it.
+
+**Recording (`follow_follower: false`, DAgger-style).** Each episode starts paused with the leader on the
+follower; the table below is the full two-key flow (also usable in training by setting `follow_follower` to
+false):
 
 | Key                   | From                           | What happens                                                                                  |
 | --------------------- | ------------------------------ | --------------------------------------------------------------------------------------------- |
@@ -87,7 +105,7 @@ Like the DAgger rollout strategy: keys only switch modes, all motion comes from 
 | `space`               | paused                         | Leader parks at home (torque off), policy resumes                                             |
 | `s` / `q`,`esc` / `r` | any                            | Episode success / failure / re-record                                                         |
 
-While the policy runs the leader rests at the home pose with torque off. Paused and correcting steps are
+In this mode the leader rests at the home pose with torque off while the policy runs. Paused and correcting steps are
 recorded as interventions: `[delta_x, delta_y, delta_z, gripper]`, the end-effector displacement of the
 commanded move divided by `end_effector_step_sizes`, clipped to [-1, 1]. Wrist rotation is not part of the
 action.
@@ -125,7 +143,7 @@ gRPC on `127.0.0.1:50051`:
  Terminal 1: LEARNER (no robot)               Terminal 2: ACTOR (drives the robot)
  ┌───────────────────────────────┐            ┌────────────────────────────────┐
  │ offline buffer: demos +       │◄───────────│ runs the policy at 10 fps      │
- │   all interventions           │ transitions│ you intervene (space / tab)    │
+ │   all interventions           │ transitions│ you intervene (space)          │
  │ online buffer: every step     │            │ s / q end each episode         │
  │ trains SAC on the Mac GPU     │───────────►│                                │
  └───────────────────────────────┘ weights    └────────────────────────────────┘
@@ -141,14 +159,20 @@ gRPC on `127.0.0.1:50051`:
   follower, streams every transition to the learner and receives new weights about every 50 s. Episodes last
   up to 20 s; after one ends the follower holds 3 s (`release_wait_s`) and resets.
 - **Device**: `LEARNER_DEVICE` / `ACTOR_DEVICE` in `local.env`; buffers live in CPU memory. On an M1 with
-  8 GB the learner is too slow (1.3 s per step at batch 64) and the actor should run on the CPU; see _Remote
-  learner on AWS EC2_ below. An NVIDIA GPU (`cuda`) is the intended learner device.
+  8 GB the learner is too slow (1.3 s per step at batch 64); run it on a GPU machine instead, see
+  [Remote learner](#remote-learner-on-a-gpu-machine-aws-ec2) below. An NVIDIA GPU (`cuda`) is the intended learner device.
 
 **Your role**: watch every episode, `s` when the cube is lifted (you are the reward), `q` on a clear failure.
-Intervene with `space` → `tab` → guide → `tab` → `space` when the policy heads somewhere wrong or is stuck.
-Corrections go into both buffers. Intervene often at the start, keep corrections short (nudge, then hand
-back), and less over time; the paper's intervention rate falls toward zero as success approaches 100%.
-Expect roughly 30-60 min of training before consistent grasps (the paper: 1-2.5 h on harder tasks).
+Intervene with a hand on the leader: `space`, guide, `space`. Corrections go into both buffers. When to
+intervene (the paper's advice):
+
+- **Early on** (first ~20-30 episodes): whenever the policy clearly heads the wrong way (drifts away from the
+  cube, closes on air, gets stuck). Correct just past the mistake, then give it back.
+- **Keep corrections short**: a few seconds, not the whole task. The policy has to explore to learn.
+- **Don't intervene** for small wobbles or slow progress while it is safe.
+- **Always intervene** before it hits the table or leaves the workspace.
+- **Over time**: less and less; the paper's intervention rate falls toward zero as success approaches 100%.
+  Expect roughly 30-60 min of training before consistent grasps (the paper: 1-2.5 h on harder tasks).
 
 **Stopping**: Ctrl+C the actor, then the learner (both arms go home). `scripts/push_hub.sh policy` uploads the
 latest checkpoint.
@@ -156,84 +180,63 @@ latest checkpoint.
 |               | Paper              | This setup                                     |
 | ------------- | ------------------ | ---------------------------------------------- |
 | Robot         | Franka             | SO-101                                         |
-| Interventions | SpaceMouse         | Leader arm, key-switched                       |
+| Interventions | SpaceMouse         | Leader arm following the follower, one key     |
 | Reward        | Trained classifier | `s` key (classifier optional, skipped for now) |
 | Demos         | 20-30              | 15                                             |
 | Image crop    | Yes                | No (full scene at 128x128)                     |
 
-<details>
-<summary><b>Remote learner on AWS EC2 (planned, the M1 is too slow to train)</b></summary>
+## Remote learner on a GPU machine (AWS EC2)
 
-### Why
-
-Measured on this Mac (M1, 8 GB) with the real demos, batch 64, no robot:
-
-| Learner on    | First step | Then                       | Peak memory |
-| ------------- | ---------- | -------------------------- | ----------- |
-| CPU           | 9.0 s      | 3.4 s / step               | 1.4 GB      |
-| Mac GPU (MPS) | 7.3 s      | 1.3 s / step (0.8 steps/s) | 1.1 GB      |
-
-The robot produces 10 steps/s, so an hour at the robot gives only ~3,000 training steps. Most of the time goes
-into the frozen ResNet-10 image encoder. The first full run (batch 256, actor also on MPS) froze the Mac: the
-learner never finished a step in 8 min and the actor dropped to 3-6 fps. The Mac is fine for the robot side,
-not for the learner.
-
-### Layout
+The learner needs a GPU; the actor needs the robot. With `EC2_HOST` and `EC2_KEY` set in `local.env`, the
+learner runs on a remote NVIDIA machine and the actor stays here.
 
 ```
-┌──────────── AWS EC2 (GPU) ────────────┐          ┌────────── Mac ───────────────┐
-│ LEARNER                               │          │ ACTOR                        │
+┌──────────── EC2 (GPU) ────────────────┐          ┌────────── robot machine ─────┐
+│ LEARNER (in tmux)                     │          │ ACTOR                        │
 │ • demos (offline buffer)              │◄─────────│ • follower, leader, cameras  │
-│ • every robot step (online buffer)    │ steps    │ • keys (space/tab/s/q)       │
-│ • trains SAC on the GPU (cuda)        │          │ • policy on the CPU (~11 ms) │
+│ • every robot step (online buffer)    │ steps    │ • keys (space/s/q)           │
+│ • trains SAC on the GPU (cuda)        │          │ • runs the policy            │
 │ • saves checkpoints                   │─────────►│                              │
 └───────────────────────────────────────┘ weights  └──────────────────────────────┘
                   ▲                       (~50 s)                │
                   └──────────── SSH tunnel (port 50051) ─────────┘
 ```
 
-- EC2 runs only the learner: no robot, cameras or USB, just the GPU, the demos and the code.
-- The Mac runs only the actor; everything at the robot stays the same.
-- `ssh -N -L 50051:localhost:50051 ubuntu@<ec2-ip>` forwards the port, so the actor keeps
-  `learner_host: 127.0.0.1`. Only SSH is open on the instance (restrict it to your IP).
-- The learner runs in `tmux` on EC2, so it survives a dropped SSH session.
+The actor still connects to `127.0.0.1:50051`; `ssh -L` forwards that port to the learner, so only SSH has to
+be open on the instance (restrict it to your IP) and the configs are the same as for local training.
+
+**Measured** (A10G `g5.2xlarge`, London, home upload): learner 0.28 s per update at batch 256 (Mac M1 GPU:
+1.3 s at batch 64), 3.5-4.8 GB GPU memory. Transitions travel in a compact format (uint8 images, each
+observation sent once): 10 MB per 100 steps instead of ~80 MB, about 8 Mbit/s of upload at 10 fps. Weights
+come back as 45 MB every ~50 s.
 
 ### Instance
 
 | Instance      | GPU         | Approx. on-demand price |
 | ------------- | ----------- | ----------------------- |
 | `g4dn.xlarge` | T4, 16 GB   | ~$0.5/h                 |
-| `g6.xlarge`   | L4, 24 GB   | ~$0.8/h (preferred)     |
+| `g6.xlarge`   | L4, 24 GB   | ~$0.8/h                 |
 | `g5.xlarge`   | A10G, 24 GB | ~$1/h                   |
 
-- AMI: **Deep Learning AMI (Ubuntu)** (CUDA and PyTorch preinstalled), region closest to the robot.
+- Ubuntu with an NVIDIA driver (e.g. the **Deep Learning AMI**), Python 3.12+, `tmux`, `rsync`; region close
+  to the robot.
 - New accounts often have a GPU quota of 0: _Service Quotas → EC2 → "Running On-Demand G and VT instances"_,
   needs at least 4 vCPUs.
-- Stop the instance after each session; a stopped instance only costs its disk.
+- **Stop the instance after each session**; a stopped instance only costs its disk.
 
-### Before it works (to do)
+### Commands (from this folder on the robot machine)
 
-1. **Smaller transfer format.** Each step is currently sent as ~0.8 MB (both images as float32, for state and
-   next state): ~157 MB per episode, ~60 Mbit/s of sustained upload at 10 fps. Plan: send images as uint8 and
-   drop the duplicated next state (~8x smaller, ~20 MB per episode); the learner converts back.
-2. `scripts/ec2_setup.sh`: rsync the lerobot branch and this project to the instance, install, `hf auth login`,
-   download `$HF_USER/so101_leader_demos`.
-3. `scripts/ec2_learner.sh`: start the learner in tmux on EC2 (`device: cuda`, batch 256).
-4. `scripts/run_actor_remote.sh`: open the SSH tunnel and start the actor (`--policy.device=cpu`).
-5. Connection test without the robot.
+| Step | Command                        | What                                                                                                                                                                                 |
+| ---- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | `scripts/ec2_setup.sh`         | Copies this checkout, the URDF, the demos and `local.env` (with the remote Python, `cuda`), installs lerobot in `~/$EC2_DIR/.venv`, checks the GPU. Again after code or demo changes |
+| 2    | `scripts/ec2_learner.sh start` | Starts the learner in tmux on the instance                                                                                                                                           |
+| 3    | `scripts/ec2_learner.sh log`   | Follows its log (Ctrl+C stops following only); wait for `Optimization frequency loop`                                                                                                |
+| 4    | `scripts/run_actor_remote.sh`  | **Moves the robot.** Opens the tunnel and starts the actor; Ctrl+C stops it, arms go home                                                                                            |
+| 5    | `scripts/ec2_learner.sh stop`  | Stops the learner (`status` shows whether it runs)                                                                                                                                   |
+| 6    | `scripts/ec2_learner.sh pull`  | Copies the checkpoints to `outputs/train/`, then `scripts/push_hub.sh policy` can upload one                                                                                         |
 
-Needs: the instance's IP and the path to its `.pem` key.
-
-### A session
-
-1. Start the instance in the AWS console.
-2. Mac: `scripts/ec2_learner.sh` (learner starts on EC2).
-3. Mac: `scripts/run_actor_remote.sh` (tunnel + actor; the robot starts moving).
-4. Train as usual: watch, intervene, `s` / `q`.
-5. Ctrl+C the actor (arms go home), stop the learner, **stop the instance**.
-6. Checkpoints stay on EC2; `push_hub.sh policy` can upload one from there.
-
-</details>
+Then stop the instance in the AWS console. The remote copy lives in `~/$EC2_DIR/` (code, venv, outputs) and
+leaves anything else on the machine alone.
 
 ## Hugging Face Hub
 
@@ -251,11 +254,12 @@ retried with `scripts/push_hub.sh demos`.
 
 ## Tuning (`processor.leader_intervention`)
 
-| Field                 | Default                    | Meaning                                                 |
-| --------------------- | -------------------------- | ------------------------------------------------------- |
-| `pause_key`           | space                      | Pause / resume the policy                               |
-| `correction_key`      | tab                        | Start / stop a correction                               |
-| `handover_duration_s` | 1.5                        | Leader → follower move when pausing                     |
-| `max_joint_speed`     | 90                         | Follower joint speed cap while copying the leader (°/s) |
-| `gripper_threshold`   | 3.0                        | Gripper difference for open/close label                 |
-| `start_paused`        | false (true for recording) | Start each episode paused, leader on the follower       |
+| Field                 | Default                     | Meaning                                                 |
+| --------------------- | --------------------------- | ------------------------------------------------------- |
+| `pause_key`           | space                       | Pause / resume the policy                               |
+| `correction_key`      | tab                         | Start / stop a correction                               |
+| `handover_duration_s` | 1.5                         | Leader → follower move when pausing                     |
+| `max_joint_speed`     | 90                          | Follower joint speed cap while copying the leader (°/s) |
+| `gripper_threshold`   | 3.0                         | Gripper difference for open/close label                 |
+| `start_paused`        | false (true for recording)  | Start each episode paused, leader on the follower       |
+| `follow_follower`     | false (true for train/test) | Leader follows the follower; `space` alone takes over   |

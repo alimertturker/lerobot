@@ -410,3 +410,129 @@ def test_leader_phase_reaches_the_control_loop_transition(setup):
     )
     assert out[TransitionKey.INFO][LEADER_PHASE_KEY] == "correcting"
     assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is True
+
+
+# One-key mode: the leader follows the follower while the policy runs.
+
+
+def test_follow_mode_leader_follows_follower_while_policy_runs(setup):
+    leader, _, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    leader.position = joints(30.0)
+    out = run(pipeline, joints(10.0))  # first step: the leader is moved onto the follower
+    assert leader.torque
+    assert leader.feedback[-1] == joints(10.0)
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is False
+    torch.testing.assert_close(out[TransitionKey.ACTION], torch.tensor([0.1, 0.0, 0.0, 1.0]))
+
+    out = run(pipeline, joints(11.0))  # then it tracks the follower every step
+    assert leader.feedback[-1] == joints(11.0)
+    assert step.phase is LeaderPhase.AUTONOMOUS
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is False
+
+
+def test_follow_mode_one_key_takes_over_and_gives_back(setup):
+    leader, events, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    follower = joints(10.0)
+    leader.position = dict(follower)
+    run(pipeline, follower)
+
+    events.dispatch("space")
+    out = run(pipeline, follower)
+    assert step.phase is LeaderPhase.CORRECTING
+    assert not leader.torque
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is True
+    assert out[TransitionKey.INFO][LEADER_PHASE_KEY] == "correcting"
+
+    leader.position = joints(10.0, shoulder_pan=30.0)
+    out = run(pipeline, follower)
+    torch.testing.assert_close(out[TransitionKey.ACTION][0], torch.tensor(19.0))  # rate limited
+
+    events.dispatch("space")
+    out = run(pipeline, joints(19.0, shoulder_pan=19.0))
+    assert step.phase is LeaderPhase.AUTONOMOUS
+    assert leader.torque
+    assert leader.feedback[-1] == joints(19.0, shoulder_pan=19.0)  # back on the follower, not parked
+    assert joints(-90.0) not in leader.feedback
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is False
+    torch.testing.assert_close(out[TransitionKey.ACTION], torch.tensor([0.1, 0.0, 0.0, 1.0]))
+
+
+def test_follow_mode_ignores_correction_key_and_start_paused(setup):
+    leader, events, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    step.config.start_paused = True
+    pipeline.reset()
+    run(pipeline, joints(0.0))
+    assert step.phase is LeaderPhase.AUTONOMOUS
+
+    events.dispatch("tab")
+    run(pipeline, joints(0.0))
+    assert step.phase is LeaderPhase.AUTONOMOUS
+    assert leader.torque
+
+
+def test_follow_mode_episode_end_holds_leader_then_follows_next_episode(setup):
+    leader, events, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    run(pipeline, joints(0.0))
+    events.dispatch("space")
+    run(pipeline, joints(0.0))
+    leader.position = joints(4.0)
+
+    events.dispatch("q")
+    out = run(pipeline, joints(0.0))
+    assert out[TransitionKey.DONE] is True
+    assert leader.torque
+    assert leader.feedback[-1] == joints(4.0)
+
+    pipeline.reset()
+    assert step.phase is LeaderPhase.AUTONOMOUS
+    assert leader.torque
+    assert joints(-90.0) not in leader.feedback
+    run(pipeline, joints(20.0))  # follower at its reset pose: the leader moves onto it
+    assert leader.feedback[-1] == joints(20.0)
+
+
+def _fail_once(leader, method):
+    original = getattr(leader, method)
+
+    def failing(*args, **kwargs):
+        setattr(leader, method, original)
+        raise RuntimeError(
+            "Failed to write 'Lock' on id_=5 with '1' after 1 tries. [RxPacketError] Input voltage error!"
+        )
+
+    setattr(leader, method, failing)
+
+
+def test_follow_mode_leader_bus_error_is_retried_not_raised(setup):
+    leader, _, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    _fail_once(leader, "enable_torque")
+    out = run(pipeline, joints(10.0))  # the move onto the follower fails: no exception, policy keeps running
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is False
+    torch.testing.assert_close(out[TransitionKey.ACTION], torch.tensor([0.1, 0.0, 0.0, 1.0]))
+    assert not step._following
+
+    run(pipeline, joints(10.0))  # retried on the next step
+    assert step._following
+    assert leader.torque
+    assert leader.feedback[-1] == joints(10.0)
+
+
+def test_follow_mode_failed_release_keeps_the_policy_in_control(setup):
+    leader, events, step, pipeline, _ = setup
+    step.config.follow_follower = True
+    run(pipeline, joints(10.0))
+    _fail_once(leader, "disable_torque")
+    events.dispatch("space")
+    out = run(pipeline, joints(10.0))
+    assert step.phase is LeaderPhase.AUTONOMOUS
+    assert out[TransitionKey.INFO][TeleopEvents.IS_INTERVENTION] is False
+
+    events.dispatch("space")  # pressing again works
+    run(pipeline, joints(10.0))
+    assert step.phase is LeaderPhase.CORRECTING
+    assert not leader.torque

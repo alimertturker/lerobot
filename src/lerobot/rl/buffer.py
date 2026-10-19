@@ -39,6 +39,14 @@ class BatchTransition(TypedDict):
     complementary_info: NotRequired[dict[str, torch.Tensor | float | int] | None]
 
 
+def _uint8_image_to_float(value: torch.Tensor) -> torch.Tensor:
+    """Scale uint8 images (as `make_dataset` returns them) to float in [0, 1], like the actor's observations
+    and `lerobot-train`'s batch preprocessing."""
+    if value.dtype == torch.uint8:
+        return value.to(torch.float32) / 255.0
+    return value
+
+
 def random_crop_vectorized(images: torch.Tensor, output_size: tuple) -> torch.Tensor:
     """
     Perform a per-image random crop over a batch of images in a vectorized way.
@@ -661,7 +669,7 @@ class ReplayBuffer:
             # ----- 1) Current state -----
             current_state: dict[str, torch.Tensor] = {}
             for key in state_keys:
-                val = current_sample[key]
+                val = _uint8_image_to_float(current_sample[key])
                 current_state[key] = val.unsqueeze(0)  # Add batch dimension
 
             # ----- 2) Action -----
@@ -696,7 +704,7 @@ class ReplayBuffer:
                     # Build next_state from the same keys
                     next_state_data: dict[str, torch.Tensor] = {}
                     for key in state_keys:
-                        val = next_sample[key]
+                        val = _uint8_image_to_float(next_sample[key])
                         next_state_data[key] = val.unsqueeze(0)  # Add batch dimension
                     next_state = next_state_data
 

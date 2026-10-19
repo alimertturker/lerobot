@@ -28,10 +28,12 @@ of a gamepad or keyboard. First task: pick up a cube (`"Pick up the cube"`).
 | File                                          | Change                                                                                                                                                                                                                                                                                                                    |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/lerobot/rl/leader_intervention.py` (new) | `LeaderArmInterventionStep`, `LeaderJointActionOverrideStep`, `KeyboardEpisodeEvents`, `ee_delta_action_from_joints`, `LeaderPhase`                                                                                                                                                                                       |
-| `src/lerobot/envs/configs.py`                 | `LeaderInterventionConfig` (keys, handover, speed cap, `start_paused`); `ResetConfig.home_joint_positions`, `ResetConfig.release_wait_s`                                                                                                                                                                                  |
+| `src/lerobot/envs/configs.py`                 | `LeaderInterventionConfig` (keys, handover, speed cap, `start_paused`, `follow_follower`); `ResetConfig.home_joint_positions`, `ResetConfig.release_wait_s`                                                                                                                                                               |
 | `src/lerobot/rl/gym_manipulator.py`           | `control_mode: "leader"` wiring in `make_processors`; home pose on close; processors reset before `env.reset()`; recording starts at the first take-over; `release_wait_s` hold and gripper-last reset; info merge keeps `leader_phase`; dataset always finalized; `close_env_and_processors`; `init_logging()` in `main` |
 | `src/lerobot/rl/actor.py`                     | `atexit` cleanup of env and processors (arms go home on exit)                                                                                                                                                                                                                                                             |
-| `tests/rl/test_leader_intervention.py` (new)  | 15 test functions (some parametrized): phases, labels, rate limit, keys, reset/close, start-paused, info merge                                                                                                                                                                                                            |
+| `tests/rl/test_leader_intervention.py` (new)  | 19 test functions (some parametrized): phases, labels, rate limit, keys, reset/close, start-paused, info merge                                                                                                                                                                                                            |
+| `src/lerobot/rl/buffer.py`                    | Scale uint8 dataset images to [0, 1] in `from_lerobot_dataset` (offline buffer)                                                                                                                                                                                                                                           |
+| `src/lerobot/transport/utils.py`              | Compact transition format (uint8 images, shared next state); tests in `tests/transport/test_transport_utils.py`                                                                                                                                                                                                           |
 | `docs/source/hilserl.mdx`                     | Leader-arm section (space/tab handover, config example, home on exit)                                                                                                                                                                                                                                                     |
 
 Test status at the end: `tests/rl tests/envs tests/processor` → 645 passed, 62 skipped; pre-commit clean.
@@ -55,6 +57,22 @@ torque off            leader smoothly  follower copies it                      a
 - `s` / `q`,`esc` / `r`: success / failure / re-record. An episode end while correcting first makes the leader
   hold. `reset()` (called **before** `env.reset()`) makes the leader safe before the follower moves.
 - `start_paused` (recording only): every episode starts PAUSED, so `tab` starts the demo straight away.
+
+**One-key mode (`follow_follower`, added 2026-10-19, used by the train and test configs).** The user asked for
+the leader to always follow the follower, as in the first design, but without grab detection:
+
+```
+AUTONOMOUS --space--> CORRECTING --space--> AUTONOMOUS
+leader torque on,     leader torque off,    leader holds, then
+tracks the follower   follower copies it    rejoins the follower
+```
+
+- The take-over stays on a key, so nothing is inferred from leader motion (see incident 1). Default motor
+  gains are used (the softened gains were removed), so the holding leader does not sag.
+- When the leader is away from the follower (episode start, end of a correction) it first moves onto it at
+  `max_joint_speed`, then gets the follower pose as its goal every step.
+- An episode end while correcting holds the leader (phase PAUSED until `reset()`); the leader is not parked
+  between episodes. `correction_key` and `start_paused` are ignored.
 
 ### Action labels (important)
 
@@ -89,6 +107,18 @@ The policy action is `[dx, dy, dz, gripper]`: the end-effector move divided by `
    finished a step in 8 min and the actor ran at 3-6 fps. Benchmarked afterwards (batch 64, no robot): CPU
    3.4 s/step, MPS 1.3 s/step. The M1 is fine for the actor, too slow for the learner.
 
+7. **Leader "Input voltage error" killed the actor (2026-10-19).** In one-key mode the leader holds torque
+   all the time; at an episode start its six motors moving together pulled its 5 V supply under the motors'
+   4.0 V limit, motor 5 reported it and the exception ended the actor. Fix: leader bus errors are warnings
+   and retried next step (`_leader_command`); a failed release on `space` keeps the policy in control. Root
+   cause is the leader's power supply (measured 5.0 V at rest).
+8. **Demo images on the wrong scale in the learner (2026-10-19).** Upstream `make_dataset` now returns
+   uint8 images (`a8b72d96`); `lerobot-train` divides them by 255, but `ReplayBuffer.from_lerobot_dataset`
+   did not, so the offline buffer held demos in [0, 255] while the actor's images are in [0, 1]. Training
+   mixed two scales, and the first checkpoint (step 5000) crashed when writing the offline buffer as images.
+   Fix: `_uint8_image_to_float` in `rl/buffer.py`, test `test_from_lerobot_dataset_scales_uint8_images`.
+   The 5000-step run is kept on EC2 as `outputs/train/hilserl_so101_leader_bad_image_scale_20261019`.
+
 ## Project state at the end of the session
 
 - **Configs** (`configs/`): `env_record_leader.json` (15 demos, `start_paused`), `env_test_leader.json` (no
@@ -111,10 +141,14 @@ The policy action is `[dx, dy, dz, gripper]`: the end-effector move divided by `
 
 ## Open items
 
-1. **Remote learner** (planned, not started; see the collapsible section in `README.md`): learner on an NVIDIA
-   GPU (AWS EC2 `g6.xlarge` or similar), actor on the robot machine, SSH tunnel on port 50051.
-2. **Smaller transfer format** (needed for a remote learner): each step is sent as about 0.8 MB (float32
-   images for state and next state, ~157 MB per episode). Plan: uint8 images, no duplicated next state.
+1. **Remote learner: done (2026-10-19).** `scripts/ec2_setup.sh`, `ec2_learner.sh`, `run_actor_remote.sh`,
+   settings `EC2_HOST/EC2_KEY/EC2_DIR` in `local.env`. Tested without the robot against the user's A10G
+   instance (`g5.2xlarge`, eu-west-2): tunnel round trip 101 ms, 3 fake episodes uploaded at 24.5 Mbit/s,
+   weights (45 MB) received, learner at 3.66 updates/s at batch 256 with the GPU at 94%. The fake run's output
+   was deleted. Not yet run with the robot.
+2. **Compact transfer format: done.** `transport/utils.py` `transitions_to_bytes` sends images in [0, 1] as
+   uint8 and a `next_state` entry equal to the next transition's `state` once (10 MB instead of ~80 MB per
+   100 steps); `bytes_to_transitions` still reads plain lists.
 3. **Actor on CPU on Apple Silicon** (`ACTOR_DEVICE=cpu`, about 11 ms per step for the encoder), not yet tried
    on the robot.
 4. The lerobot docs (`docs/source/hilserl.mdx`) don't yet mention `start_paused`, `release_wait_s` or

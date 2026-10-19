@@ -45,7 +45,24 @@ SETUP_ARGS=(
   --dataset.root="$DATASET_ROOT"
 )
 
-# Keys pressed for the robot (space/tab/s/q) are also queued as terminal input; drop them on exit so
+# Remote learner (scripts/ec2_*.sh). LEARNER_PORT must match actor_learner_config.learner_port.
+LEARNER_PORT=50051
+REMOTE_PROJECT="${EC2_DIR:-hilserl}/lerobot/examples/hilserl_so101"  # relative to the remote home
+require_ec2() {
+  if [ -z "${EC2_HOST:-}" ] || [ -z "${EC2_KEY:-}" ]; then
+    echo "Set EC2_HOST and EC2_KEY in local.env to use the remote learner." >&2
+    exit 1
+  fi
+  if [ ! -f "$EC2_KEY" ]; then
+    echo "EC2_KEY=$EC2_KEY not found (check local.env)" >&2
+    exit 1
+  fi
+}
+ec2_ssh() {
+  ssh -i "$EC2_KEY" -o ServerAliveInterval=30 -o ConnectTimeout=15 "$EC2_HOST" "$@"
+}
+
+# Keys pressed for the robot (space/tab/s/q/r) are also queued as terminal input; drop them on exit so
 # bash doesn't run them (e.g. tab completion) after the script ends.
 flush_tty_input() {
   if [ -t 0 ]; then

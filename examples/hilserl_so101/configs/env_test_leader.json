@@ -74,7 +74,8 @@
         "correction_key": "tab",
         "handover_duration_s": 1.5,
         "max_joint_speed": 90.0,
-        "gripper_threshold": 3.0
+        "gripper_threshold": 3.0,
+        "follow_follower": true
       },
       "reward_classifier": {
         "pretrained_path": null,

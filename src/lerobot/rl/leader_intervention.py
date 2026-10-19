@@ -42,6 +42,7 @@ import atexit
 import contextlib
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -78,6 +79,8 @@ GRIPPER_STAY = 1.0
 GRIPPER_DECREASE = 2.0
 
 LEADER_PARK_DURATION_S = 2.0
+# Minimum time between two "leader command failed" warnings.
+LEADER_WARNING_INTERVAL_S = 2.0
 
 
 class LeaderPhase(Enum):
@@ -92,6 +95,13 @@ _TRANSITIONS: dict[tuple[LeaderPhase, str], LeaderPhase] = {
     (LeaderPhase.PAUSED, "pause"): LeaderPhase.AUTONOMOUS,
     (LeaderPhase.PAUSED, "correction"): LeaderPhase.CORRECTING,
     (LeaderPhase.CORRECTING, "correction"): LeaderPhase.PAUSED,
+}
+
+# With `follow_follower` the leader already sits on the follower, so one key starts and ends a correction.
+# PAUSED is only used to hold the leader when an episode ends during a correction.
+_FOLLOW_TRANSITIONS: dict[tuple[LeaderPhase, str], LeaderPhase] = {
+    (LeaderPhase.AUTONOMOUS, "pause"): LeaderPhase.CORRECTING,
+    (LeaderPhase.CORRECTING, "pause"): LeaderPhase.AUTONOMOUS,
 }
 
 
@@ -109,12 +119,14 @@ class KeyboardEpisodeEvents:
         rerecord_key: str,
         pause_key: str = "space",
         correction_key: str = "tab",
+        follow_follower: bool = False,
     ):
         self.success_key = success_key
         self.failure_keys = tuple(failure_keys)
         self.rerecord_key = rerecord_key
         self.pause_key = pause_key
         self.correction_key = correction_key
+        self.follow_follower = follow_follower
         self._lock = threading.Lock()
         self._pending: dict[TeleopEvents, bool] = {}
         self._mode_events: list[str] = []
@@ -124,11 +136,14 @@ class KeyboardEpisodeEvents:
         if self._listener is not None:
             return
         failure = "/".join(f"'{k}'" for k in self.failure_keys)
+        if self.follow_follower:
+            modes = f"'{self.pause_key}'=take over / give back to the policy"
+        else:
+            modes = f"'{self.pause_key}'=pause/resume policy, '{self.correction_key}'=start/stop correction"
         self._listener = create_key_listener(
             self.dispatch,
             controls_help=(
-                f"'{self.pause_key}'=pause/resume policy, '{self.correction_key}'=start/stop correction, "
-                f"'{self.success_key}'=success, {failure}=failure, '{self.rerecord_key}'=re-record"
+                f"{modes}, '{self.success_key}'=success, {failure}=failure, '{self.rerecord_key}'=re-record"
             ),
         )
 
@@ -218,6 +233,9 @@ def ee_delta_action_from_joints(
 class LeaderArmInterventionStep(ProcessorStep):
     """Key-switched leader-arm interventions; turns the commanded follower move into a policy action.
 
+    By default the leader is parked while the policy runs and is brought onto the follower on pause. With
+    `config.follow_follower` it follows the follower every step instead, and one key takes over directly.
+
     Expects the leader's joint positions in `complementary_data["teleop_action"]` (written by
     `AddTeleopActionAsComplimentaryDataStep`) and the follower's joint positions as the observation.
     During an intervention (PAUSED or CORRECTING) it replaces `complementary_data["teleop_action"]` with
@@ -253,6 +271,8 @@ class LeaderArmInterventionStep(ProcessorStep):
     _torque_enabled: bool = field(default=False, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _pause_pending: bool = field(default=False, init=False, repr=False)
+    _following: bool = field(default=False, init=False, repr=False)
+    _last_leader_warning: float = field(default=float("-inf"), init=False, repr=False)
 
     def __post_init__(self):
         if not teleop_supports_feedback(self.teleop_device):
@@ -273,10 +293,11 @@ class LeaderArmInterventionStep(ProcessorStep):
                 self.config.rerecord_key,
                 self.config.pause_key,
                 self.config.correction_key,
+                self.config.follow_follower,
             )
         self.episode_events.start()
         self._max_step = self.config.max_joint_speed / self.fps
-        self._pause_pending = self.config.start_paused
+        self._pause_pending = self._starts_paused
         atexit.register(self.close)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -308,6 +329,9 @@ class LeaderArmInterventionStep(ProcessorStep):
             self._hold_leader_at(leader)
             self.phase = LeaderPhase.PAUSED
 
+        if self.config.follow_follower and self.phase is LeaderPhase.AUTONOMOUS:
+            self._follow(follower, leader)
+
         is_intervention = self.phase is not LeaderPhase.AUTONOMOUS
         if is_intervention:
             assert self._target is not None
@@ -336,13 +360,34 @@ class LeaderArmInterventionStep(ProcessorStep):
         new_transition[TransitionKey.INFO] = info
         return new_transition
 
+    @property
+    def _starts_paused(self) -> bool:
+        return self.config.start_paused and not self.config.follow_follower
+
     def _switch(self, event: str, follower: dict[str, float], leader: dict[str, float]) -> None:
-        new_phase = _TRANSITIONS.get((self.phase, event))
+        transitions = _FOLLOW_TRANSITIONS if self.config.follow_follower else _TRANSITIONS
+        new_phase = transitions.get((self.phase, event))
         if new_phase is None:
             key = self.config.pause_key if event == "pause" else self.config.correction_key
             logger.info("Ignoring '%s' while %s", key, self.phase.value)
             return
         logger.info("Intervention phase: %s -> %s", self.phase.value, new_phase.value)
+
+        if self.config.follow_follower:
+            if new_phase is LeaderPhase.CORRECTING:
+                # The leader is already on the follower: hold the follower and release the leader.
+                self._following = False
+                if not self._leader_command("release", self.teleop_device.disable_torque):
+                    logger.warning("Could not release the leader; press '%s' again", self.config.pause_key)
+                    return
+                self._target = dict(follower)
+                self._torque_enabled = False
+            else:
+                # Hold the leader where the operator left it; it rejoins the follower on the next step.
+                self._hold_leader_at(leader)
+                self._target = None
+            self.phase = new_phase
+            return
 
         if self.phase is LeaderPhase.AUTONOMOUS:
             # Hold the follower where it is and bring the leader onto it.
@@ -369,6 +414,41 @@ class LeaderArmInterventionStep(ProcessorStep):
             self._target = None
         self.phase = new_phase
 
+    def _follow(self, follower: dict[str, float], leader: dict[str, float]) -> None:
+        """Keep the leader on the follower; after a gap (episode start, correction end) move it over at
+        `max_joint_speed` first."""
+        if self._following:
+            # On failure, catch up again with a smooth move on the next step.
+            self._following = self._leader_command("follow", self.teleop_device.send_feedback, follower)
+            return
+        gap = max(abs(leader[k] - follower[k]) for k in follower)
+        self._following = self._leader_command(
+            "move onto the follower",
+            teleop_smooth_move_to,
+            self.teleop_device,
+            follower,
+            duration_s=gap / self.config.max_joint_speed,
+            fps=30,
+        )
+        self._torque_enabled = self._torque_enabled or self._following
+
+    def _leader_command(self, what: str, command: Any, *args: Any, **kwargs: Any) -> bool:
+        """Run a leader-arm bus command; on a bus error warn and return False instead of raising.
+
+        A missed leader command leaves the follower unaffected: while the policy runs the follower ignores
+        the leader. The usual cause is a weak leader power supply ("Input voltage error") when its motors
+        hold or move under torque.
+        """
+        try:
+            command(*args, **kwargs)
+            return True
+        except (RuntimeError, ConnectionError, OSError) as e:
+            now = time.monotonic()
+            if now - self._last_leader_warning >= LEADER_WARNING_INTERVAL_S:
+                self._last_leader_warning = now
+                logger.warning("Leader arm: %s failed, will retry (%s)", what, e)
+            return False
+
     def _rate_limited(self, previous: dict[str, float], desired: dict[str, float]) -> dict[str, float]:
         return {
             k: previous[k] + float(np.clip(desired[k] - previous[k], -self._max_step, self._max_step))
@@ -376,9 +456,12 @@ class LeaderArmInterventionStep(ProcessorStep):
         }
 
     def _hold_leader_at(self, leader: dict[str, float]) -> None:
-        self.teleop_device.send_feedback(leader)
-        self.teleop_device.enable_torque()
-        self._torque_enabled = True
+        def hold() -> None:
+            self.teleop_device.send_feedback(leader)
+            self.teleop_device.enable_torque()
+
+        if self._leader_command("hold", hold):
+            self._torque_enabled = True
 
     def _park_leader(self) -> None:
         """Move the leader to its home pose and release it there; without a home pose keep it holding."""
@@ -392,17 +475,21 @@ class LeaderArmInterventionStep(ProcessorStep):
     def reset(self) -> None:
         """Make the leader safe before the environment reset and set up the next episode.
 
-        The leader is held if it was released. With `start_paused` it keeps holding and is moved onto the
-        follower at the first step of the next episode; otherwise it is parked and the policy takes over.
+        The leader is held if it was released. With `start_paused` or `follow_follower` it keeps holding
+        and is moved onto the follower at the first step of the next episode; otherwise it is parked and the
+        policy takes over.
         """
+        keep_leader = self.config.start_paused or self.config.follow_follower
         if self.phase is not LeaderPhase.AUTONOMOUS:
             if self.phase is LeaderPhase.CORRECTING:
-                self._hold_leader_at(self.teleop_device.get_action())
-            if not self.config.start_paused:
+                self._leader_command("hold", lambda: self._hold_leader_at(self.teleop_device.get_action()))
+            if not keep_leader:
                 self._park_leader()
             self.phase = LeaderPhase.AUTONOMOUS
             self._target = None
-        self._pause_pending = self.config.start_paused
+        # The follower moves to its reset pose, so the leader has to catch up before following again.
+        self._following = False
+        self._pause_pending = self._starts_paused
         if self.episode_events is not None:
             self.episode_events.clear()
 

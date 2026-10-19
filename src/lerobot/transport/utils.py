@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 
+from lerobot.utils.constants import OBS_IMAGE
 from lerobot.utils.transition import Transition
 
 from . import services_pb2
@@ -137,16 +138,89 @@ def bytes_to_python_object(buffer: bytes) -> Any:
     return obj
 
 
+# Compact transition format: images in [0, 1] are sent as uint8 and a `next_state` entry equal to the next
+# transition's `state` entry is sent once. About 8x smaller for image observations, which matters when the
+# learner runs on another machine.
+COMPACT_TRANSITIONS_FORMAT = "lerobot.compact_transitions.v1"
+_SAME_AS_NEXT_STATE = "__same_as_next_transition_state__"
+_UINT8_KEY = "__uint8__"
+
+
+def _encode_value(key: str, value: Any) -> Any:
+    if (
+        key.startswith(OBS_IMAGE)
+        and isinstance(value, torch.Tensor)
+        and value.is_floating_point()
+        and value.numel() > 0
+        and value.min() >= 0
+        and value.max() <= 1
+    ):
+        # Quantization error is at most 1/510, below what the camera resolves.
+        return {
+            _UINT8_KEY: (value * 255).round().to(torch.uint8),
+            "dtype": str(value.dtype).removeprefix("torch."),
+        }
+    return value
+
+
+def _decode_value(value: Any) -> Any:
+    if isinstance(value, dict) and _UINT8_KEY in value:
+        return value[_UINT8_KEY].to(getattr(torch, value["dtype"])) / 255
+    return value
+
+
+def _pack_transitions(transitions: list[Transition]) -> dict[str, Any]:
+    packed = []
+    for i, transition in enumerate(transitions):
+        following_state = transitions[i + 1]["state"] if i + 1 < len(transitions) else {}
+        next_state = {}
+        for key, value in transition["next_state"].items():
+            following = following_state.get(key)
+            if (
+                isinstance(value, torch.Tensor)
+                and isinstance(following, torch.Tensor)
+                and value.shape == following.shape
+                and value.dtype == following.dtype
+                and torch.equal(value, following)
+            ):
+                next_state[key] = _SAME_AS_NEXT_STATE
+            else:
+                next_state[key] = _encode_value(key, value)
+        item = dict(transition)
+        item["state"] = {key: _encode_value(key, value) for key, value in transition["state"].items()}
+        item["next_state"] = next_state
+        packed.append(item)
+    return {"format": COMPACT_TRANSITIONS_FORMAT, "transitions": packed}
+
+
+def _unpack_transitions(packed: list[dict[str, Any]]) -> list[Transition]:
+    transitions: list[dict[str, Any]] = []
+    for item in packed:
+        unpacked = dict(item)
+        unpacked["state"] = {key: _decode_value(value) for key, value in item["state"].items()}
+        transitions.append(unpacked)
+    for i, unpacked in enumerate(transitions):
+        unpacked["next_state"] = {
+            key: transitions[i + 1]["state"][key]
+            if isinstance(value, str) and value == _SAME_AS_NEXT_STATE
+            else _decode_value(value)
+            for key, value in unpacked["next_state"].items()
+        }
+    return transitions  # type: ignore[return-value]
+
+
 def bytes_to_transitions(buffer: bytes) -> list[Transition]:
     bytes_buffer = io.BytesIO(buffer)
     bytes_buffer.seek(0)
-    transitions = torch.load(bytes_buffer, weights_only=True)
-    return transitions
+    data = torch.load(bytes_buffer, weights_only=True)
+    if isinstance(data, dict) and data.get("format") == COMPACT_TRANSITIONS_FORMAT:
+        return _unpack_transitions(data["transitions"])
+    return data  # plain list (older senders)
 
 
 def transitions_to_bytes(transitions: list[Transition]) -> bytes:
     bytes_buffer = io.BytesIO()
-    torch.save(transitions, bytes_buffer)
+    torch.save(_pack_transitions(transitions), bytes_buffer)
     return bytes_buffer.getvalue()
 
 

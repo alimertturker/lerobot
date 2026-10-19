@@ -297,8 +297,8 @@ class ResetConfig:
 class LeaderInterventionConfig:
     """Configuration for human interventions with an actuated leader arm (`control_mode: "leader"`).
 
-    Interventions are switched with keys, as in the DAgger rollout strategy. While the policy runs the
-    leader is parked. `pause_key` pauses the policy, holds the follower still and drives the leader onto the
+    Interventions are switched with keys, as in the DAgger rollout strategy. By default the leader is
+    parked while the policy runs (see `follow_follower` for a one-key mode where it follows the follower). `pause_key` pauses the policy, holds the follower still and drives the leader onto the
     follower's pose; with a hand on the leader, `correction_key` releases its torque so the follower copies
     it; `correction_key` again holds the leader, and `pause_key` resumes the policy. Joint values are in the
     leader's normalized units (degrees with `use_degrees=True`).
@@ -317,6 +317,10 @@ class LeaderInterventionConfig:
     # Start every episode paused (leader already on the follower), so `correction_key` starts a
     # demonstration right away. Useful when recording demonstrations without a policy.
     start_paused: bool = False
+    # One-key mode: while the policy runs the leader follows the follower (torque on), so `pause_key`
+    # releases it and the operator takes over without a handover move; `pause_key` again holds the leader
+    # and resumes the policy. `correction_key` and `start_paused` are not used in this mode.
+    follow_follower: bool = False
     # Keys that end the episode.
     success_key: str = "s"
     failure_keys: tuple[str, ...] = ("q", "esc")

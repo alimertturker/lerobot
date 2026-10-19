@@ -716,16 +716,22 @@ def control_loop(
     print("Controls:")
     if cfg.env.processor.control_mode == "leader":
         keys = cfg.env.processor.leader_intervention or LeaderInterventionConfig()
-        print(f"- '{keys.pause_key}': pause (the leader moves onto the follower and holds)")
-        print(f"- '{keys.correction_key}': with a hand on the leader, take over / hold again")
-        print(f"- '{keys.pause_key}' again (after holding): resume the policy")
+        if keys.follow_follower:
+            print("- The leader follows the follower")
+            print(f"- '{keys.pause_key}': with a hand on the leader, take over")
+            print(f"- '{keys.pause_key}' again: the leader holds and the policy continues")
+        else:
+            print(f"- '{keys.pause_key}': pause (the leader moves onto the follower and holds)")
+            print(f"- '{keys.correction_key}': with a hand on the leader, take over / hold again")
+            print(f"- '{keys.pause_key}' again (after holding): resume the policy")
         print(
             f"- '{keys.success_key}' success, {'/'.join(keys.failure_keys)} failure, '{keys.rerecord_key}' re-record"
         )
-        if keys.start_paused:
+        if keys.start_paused and not keys.follow_follower:
             print("- Each episode starts paused with the leader on the follower")
         if cfg.mode == "record":
-            print(f"- Recording starts at the first '{keys.correction_key}' of each episode")
+            take_over_key = keys.pause_key if keys.follow_follower else keys.correction_key
+            print(f"- Recording starts at the first '{take_over_key}' of each episode")
     else:
         print("- Use gamepad/teleop device for intervention")
     print("- When not intervening, robot will stay still")

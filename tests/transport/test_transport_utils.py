@@ -570,3 +570,77 @@ def test_receive_bytes_in_chunks_unknown_state():
 
     with pytest.raises(ValueError, match="Received unknown transfer state"):
         receive_bytes_in_chunks(bad_iterator, output_queue, shutdown_event)
+
+
+def _image_transitions(n: int, reset_after: int | None = None) -> list[Transition]:
+    """Consecutive transitions where next_state is the following state, as the actor produces them."""
+    observations = [
+        {"observation.images.top": torch.rand(3, 128, 128), "observation.state": torch.randn(6)}
+        for _ in range(n + 1)
+    ]
+    transitions = []
+    for i in range(n):
+        # Separate copies, as after the actor moves each observation off the policy device.
+        next_obs = {k: v.clone() for k, v in observations[i + 1].items()}
+        if reset_after is not None and i == reset_after:
+            # Episode end: the next transition starts from a reset observation.
+            next_obs = {
+                "observation.images.top": torch.rand(3, 128, 128),
+                "observation.state": torch.randn(6),
+            }
+        transitions.append(
+            Transition(
+                state=observations[i],
+                action=torch.randn(4),
+                reward=torch.tensor(0.0),
+                done=torch.tensor(i == reset_after),
+                truncated=torch.tensor(False),
+                next_state=next_obs,
+                complementary_info={"is_intervention": torch.tensor(i % 2 == 0)},
+            )
+        )
+    return transitions
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_transitions_to_bytes_compact_images_and_shared_next_state():
+    from lerobot.transport.utils import bytes_to_transitions, transitions_to_bytes
+
+    transitions = _image_transitions(10, reset_after=4)
+    data = transitions_to_bytes(transitions)
+    raw = io.BytesIO()
+    torch.save(transitions, raw)
+    assert len(data) < len(raw.getvalue()) / 6
+
+    reconstructed = bytes_to_transitions(data)
+    assert len(reconstructed) == len(transitions)
+    for original, item in zip(transitions, reconstructed, strict=True):
+        for part in ("state", "next_state"):
+            image = item[part]["observation.images.top"]
+            assert image.dtype == torch.float32
+            assert (image - original[part]["observation.images.top"]).abs().max() <= 1 / 510 + 1e-6
+            # Non-image values are sent unchanged.
+            assert torch.equal(item[part]["observation.state"], original[part]["observation.state"])
+        assert torch.equal(item[ACTION], original[ACTION])
+        assert torch.equal(item["done"], original["done"])
+        assert torch.equal(
+            item["complementary_info"]["is_intervention"], original["complementary_info"]["is_intervention"]
+        )
+    # The episode end keeps its own next state, not the next episode's first state.
+    assert torch.allclose(
+        reconstructed[4]["next_state"]["observation.images.top"],
+        transitions[4]["next_state"]["observation.images.top"],
+        atol=1 / 510 + 1e-6,
+    )
+
+
+@skip_if_package_missing("grpcio", "grpc")
+def test_bytes_to_transitions_reads_plain_lists():
+    from lerobot.transport.utils import bytes_to_transitions
+
+    transitions = _image_transitions(3)
+    raw = io.BytesIO()
+    torch.save(transitions, raw)
+    reconstructed = bytes_to_transitions(raw.getvalue())
+    for original, item in zip(transitions, reconstructed, strict=True):
+        assert_transitions_equal(original, item)

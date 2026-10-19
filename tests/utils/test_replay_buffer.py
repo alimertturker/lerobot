@@ -682,3 +682,35 @@ def test_async_iterator_multiple_iterations():
 
     # Ensure iterator can be disposed without blocking
     del iterator
+
+
+def test_from_lerobot_dataset_scales_uint8_images(tmp_path):
+    """`make_dataset` returns uint8 images; the buffer must hold them in [0, 1] like the actor's
+    observations, and be savable again (as at a learner checkpoint)."""
+    ds, replay_buffer = create_dataset_from_replay_buffer(tmp_path)
+
+    class Uint8Images:
+        """Returns images as uint8, as `LeRobotDataset(return_uint8=True)` decodes video frames."""
+
+        def __len__(self):
+            return len(ds)
+
+        def __getitem__(self, idx):
+            item = dict(ds[idx])
+            item[OBS_IMAGE] = (item[OBS_IMAGE] * 255).round().to(torch.uint8)
+            return item
+
+    uint8_ds = Uint8Images()
+
+    buffer = ReplayBuffer.from_lerobot_dataset(
+        uint8_ds, state_keys=list(state_dims()), device="cpu", capacity=replay_buffer.capacity, use_drq=False
+    )
+    images = buffer.states[OBS_IMAGE][: len(replay_buffer)]
+    assert images.dtype == torch.float32
+    assert images.min() >= 0.0 and images.max() <= 1.0
+    torch.testing.assert_close(
+        images, replay_buffer.states[OBS_IMAGE][: len(replay_buffer)], rtol=0.4, atol=0.004
+    )
+    assert buffer.next_states[OBS_IMAGE][: len(replay_buffer)].max() <= 1.0
+
+    buffer.to_lerobot_dataset(DUMMY_REPO_ID, root=tmp_path / "resaved")
