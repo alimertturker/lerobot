@@ -20,13 +20,23 @@ environment: LEADER_PORT, LEADER_ID, URDF, EE_BOUNDS_MIN, EE_BOUNDS_MAX.
 
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.teleoperators.so_leader import SO101LeaderConfig, SOLeader
 
-leader = SOLeader(SO101LeaderConfig(port=os.environ["LEADER_PORT"], id=os.environ["LEADER_ID"]))
+calibration_dir = os.environ.get("CALIBRATION_DIR")
+leader = SOLeader(
+    SO101LeaderConfig(
+        port=os.environ["LEADER_PORT"],
+        id=os.environ["LEADER_ID"],
+        calibration_dir=Path(calibration_dir).expanduser() if calibration_dir else None,
+    )
+)
+if not leader.calibration:
+    raise FileNotFoundError(f"Leader calibration not found or empty: {leader.calibration_fpath}")
 leader.connect(calibrate=False)
 try:
     action = leader.get_action()

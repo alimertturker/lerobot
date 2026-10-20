@@ -70,19 +70,21 @@ class SpatialLearnedEmbeddings(nn.Module):
         Forward pass for spatial embedding
 
         Args:
-            features: Input tensor of shape [B, H, W, C] or [H, W, C] if no batch
+            features: Backbone output with last_hidden_state in [B, C, H, W]
+                layout, or a tensor in [B, C, H, W] / [C, H, W] layout.
         Returns:
             Output tensor of shape [B, C*F] or [C*F] if no batch
         """
 
-        features = features.last_hidden_state
+        if not isinstance(features, Tensor):
+            features = features.last_hidden_state
 
         original_shape = features.shape
         if features.dim() == 3:
             features = features.unsqueeze(0)  # Add batch dim
 
-        features_expanded = features.unsqueeze(-1)  # [B, H, W, C, 1]
-        kernel_expanded = self.kernel.unsqueeze(0)  # [1, H, W, C, F]
+        features_expanded = features.unsqueeze(-1)  # [B, C, H, W, 1]
+        kernel_expanded = self.kernel.unsqueeze(0)  # [1, C, H, W, F]
 
         # Element-wise multiplication and spatial reduction
         output = (features_expanded * kernel_expanded).sum(dim=(2, 3))  # Sum H,W
@@ -141,9 +143,10 @@ class Classifier(PreTrainedRewardModel):
 
         if self.is_cnn:
             self.encoders = nn.ModuleDict()
-            for image_key in self.image_keys:
-                encoder = self._create_single_encoder()
-                self.encoders[image_key] = encoder
+            for feature_key, feature in config.input_features.items():
+                if feature_key.startswith(OBS_IMAGE):
+                    image_key = feature_key.replace(".", "_")
+                    self.encoders[image_key] = self._create_single_encoder(feature.shape)
 
         self._build_classifier_head()
 
@@ -161,13 +164,44 @@ class Classifier(PreTrainedRewardModel):
         """Freeze the encoder parameters."""
         for param in self.encoder.parameters():
             param.requires_grad = False
+        self.encoder.eval()
 
-    def _create_single_encoder(self):
+    def train(self, mode: bool = True):
+        """Train adaptation layers and the head while keeping the backbone in eval mode."""
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
+    def _backbone_features(self, x: Tensor):
+        """Extract frozen features; trainable camera layers run outside this context."""
+        self.encoder.eval()
+        with torch.no_grad():
+            return self.encoder(x)
+
+    def _create_single_encoder(self, image_shape):
+        # Infer spatial dimensions from each camera's configured CHW input.
+        # Keep the Sequential layout unchanged for checkpoint compatibility.
+        if len(image_shape) != 3:
+            raise ValueError(f"Expected a CHW image shape, got {image_shape}")
+        parameter = next(self.encoder.parameters(), None)
+        dummy = torch.zeros(
+            (1, *image_shape),
+            device=parameter.device if parameter is not None else "cpu",
+            dtype=parameter.dtype if parameter is not None else torch.float32,
+        )
+        features = self._backbone_features(dummy)
+        if not isinstance(features, Tensor):
+            features = features.last_hidden_state
+        if features.ndim != 4:
+            raise ValueError(f"Expected BCHW backbone features, got {tuple(features.shape)}")
+        _, channels, height, width = features.shape
+        if channels != self.feature_dim:
+            raise ValueError(f"Expected {self.feature_dim} backbone channels, got {channels}")
         encoder = nn.Sequential(
             self.encoder,
             SpatialLearnedEmbeddings(
-                height=4,
-                width=4,
+                height=height,
+                width=width,
                 channel=self.feature_dim,
                 num_features=self.config.image_embedding_pooling_dim,
             ),
@@ -203,14 +237,15 @@ class Classifier(PreTrainedRewardModel):
 
     def _get_encoder_output(self, x: torch.Tensor, image_key: str) -> torch.Tensor:
         """Extract the appropriate output from the encoder."""
-        with torch.no_grad():
-            if self.is_cnn:
-                # The HF ResNet applies pooling internally
-                outputs = self.encoders[image_key](x)
-                return outputs
-            else:  # Transformer models
-                outputs = self.encoder(x)
-                return outputs.last_hidden_state[:, 0, :]
+        features = self._backbone_features(x)
+        if self.is_cnn:
+            # Index 0 is the frozen backbone, already evaluated above.
+            # Spatial embeddings, bottleneck and LayerNorm must keep gradients.
+            outputs = features
+            for layer in list(self.encoders[image_key].children())[1:]:
+                outputs = layer(outputs)
+            return outputs
+        return features.last_hidden_state[:, 0, :]
 
     def extract_images_and_labels(self, batch: dict[str, Tensor]) -> tuple[list, Tensor]:
         """Extract image tensors and label tensors from batch."""

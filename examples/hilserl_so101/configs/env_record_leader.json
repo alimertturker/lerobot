@@ -86,7 +86,7 @@
   },
   "dataset": {
     "repo_id": "local/so101_leader_demos",
-    "task": "Pick up the cube",
+    "task": "Pick up the scotch tape",
     "root": "outputs/datasets/so101_leader_demos",
     "num_episodes_to_record": 15,
     "push_to_hub": false

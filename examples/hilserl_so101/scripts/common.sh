@@ -45,6 +45,13 @@ SETUP_ARGS=(
   --dataset.root="$DATASET_ROOT"
 )
 
+if [ -n "${CALIBRATION_DIR:-}" ]; then
+  SETUP_ARGS+=(
+    --env.robot.calibration_dir="$CALIBRATION_DIR"
+    --env.teleop.calibration_dir="$CALIBRATION_DIR"
+  )
+fi
+
 # Remote learner (scripts/ec2_*.sh). LEARNER_PORT must match actor_learner_config.learner_port.
 LEARNER_PORT=50051
 REMOTE_PROJECT="${EC2_DIR:-hilserl}/lerobot/examples/hilserl_so101"  # relative to the remote home
