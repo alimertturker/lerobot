@@ -8,4 +8,4 @@ source "$(dirname "$0")/common.sh"
 ACTOR_DIR="$PROJECT_DIR/outputs/actor/$(date +%Y%m%d_%H%M%S)"
 PYTHONUNBUFFERED=1 "$PY" -m lerobot.rl.actor --config_path "$PROJECT_DIR/configs/train_hilserl_leader.json" \
   "${SETUP_ARGS[@]}" --output_dir="$ACTOR_DIR" --policy.device="$ACTOR_DEVICE" "$@" \
-  2>&1 | tee "$PROJECT_DIR/outputs/actor.log"
+  2>&1 | tee -i "$PROJECT_DIR/outputs/actor.log"  # -i: Ctrl+C must not kill tee before the shutdown is done

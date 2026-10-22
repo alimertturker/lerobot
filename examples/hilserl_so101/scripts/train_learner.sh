@@ -5,4 +5,4 @@ source "$(dirname "$0")/common.sh"
 
 PYTHONUNBUFFERED=1 "$PY" -m lerobot.rl.learner --config_path "$PROJECT_DIR/configs/train_hilserl_leader.json" \
   "${SETUP_ARGS[@]}" --output_dir="$TRAIN_DIR" --policy.device="$LEARNER_DEVICE" "$@" \
-  2>&1 | tee "$PROJECT_DIR/outputs/learner.log"
+  2>&1 | tee -i "$PROJECT_DIR/outputs/learner.log"  # -i: Ctrl+C must not kill tee before the shutdown is done

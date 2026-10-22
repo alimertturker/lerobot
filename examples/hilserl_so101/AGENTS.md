@@ -197,6 +197,11 @@ changes divided by `inverse_kinematics.joint_step_sizes` (9°), each clipped to 
     `checkpoints_set_aside/0020000_policy_reset_on_resume` keeps the old 20000. Data: 197 of 330 online
     episodes ended with `q` (terminal, value 0), 97 of them within 3 s; take over instead. A 10 s episode
     limit (theirs: 100 steps) would cut 19 of 61 corrected successes, so it stays 20 s.
+13. **Final buffer save lost to a broken pipe (2026-10-22, 23:24 UTC).** `ec2_learner.sh stop` sent Ctrl+C; the
+    learner saved checkpoint 0029387 and started writing the buffers, then failed with `BrokenPipeError`:
+    Ctrl+C had also killed the `tee` that `train_learner.sh` pipes the output into. The swap-in save kept the
+    step-20000 buffers; the online data from steps 20000-29387 (22:37-23:24 UTC) was lost. Fix: `tee -i` in
+    `train_learner.sh` and `run_actor.sh`.
 
 ## Project state at the end of the session
 
