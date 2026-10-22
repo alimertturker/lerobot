@@ -714,3 +714,79 @@ def test_from_lerobot_dataset_scales_uint8_images(tmp_path):
     assert buffer.next_states[OBS_IMAGE][: len(replay_buffer)].max() <= 1.0
 
     buffer.to_lerobot_dataset(DUMMY_REPO_ID, root=tmp_path / "resaved")
+
+
+def test_uint8_image_storage_samples_the_same_images():
+    """Images in [0, 1] from uint8 cameras are stored as uint8 and sampled back as the same floats."""
+    states = []
+    for _ in range(5):
+        state = create_dummy_state()
+        state[OBS_IMAGE] = torch.randint(0, 256, (3, 84, 84), dtype=torch.uint8).float() / 255.0
+        states.append(state)
+
+    buffers = [
+        ReplayBuffer(10, "cpu", state_dims(), use_drq=False, store_images_as_uint8=store_images_as_uint8)
+        for store_images_as_uint8 in (False, True)
+    ]
+    for buffer in buffers:
+        for i, state in enumerate(states):
+            buffer.add(state, create_dummy_action(), 1.0, states[(i + 1) % 5], i == 4, False)
+
+    float_buffer, uint8_buffer = buffers
+    assert uint8_buffer.states[OBS_IMAGE].dtype == torch.uint8
+    assert uint8_buffer.next_states[OBS_IMAGE].dtype == torch.uint8
+    assert uint8_buffer.states[OBS_STATE].dtype == torch.float32
+    assert get_tensor_memory_consumption(uint8_buffer.states[OBS_IMAGE]) * 4 == get_tensor_memory_consumption(
+        float_buffer.states[OBS_IMAGE]
+    )
+
+    torch.manual_seed(0)
+    float_batch = float_buffer.sample(8)
+    torch.manual_seed(0)
+    uint8_batch = uint8_buffer.sample(8)
+    for part in ("state", "next_state"):
+        for key in state_dims():
+            assert uint8_batch[part][key].dtype == torch.float32
+            assert torch.equal(uint8_batch[part][key], float_batch[part][key])
+
+
+def test_from_lerobot_dataset_uint8_storage_matches_float_and_decodes_each_frame_once(tmp_path):
+    ds, replay_buffer = create_dataset_from_replay_buffer(tmp_path)
+
+    class CountingDataset:
+        def __init__(self):
+            self.reads = 0
+
+        def __len__(self):
+            return len(ds)
+
+        def __getitem__(self, idx):
+            self.reads += 1
+            return ds[idx]
+
+    float_buffer = ReplayBuffer.from_lerobot_dataset(
+        ds, state_keys=list(state_dims()), device="cpu", capacity=10, use_drq=False, optimize_memory=True
+    )
+    counting = CountingDataset()
+    uint8_buffer = ReplayBuffer.from_lerobot_dataset(
+        counting,
+        state_keys=list(state_dims()),
+        device="cpu",
+        capacity=10,
+        use_drq=False,
+        optimize_memory=True,
+        store_images_as_uint8=True,
+    )
+
+    assert counting.reads == len(ds)
+    assert uint8_buffer.states[OBS_IMAGE].dtype == torch.uint8
+    n = len(replay_buffer)
+    torch.testing.assert_close(
+        uint8_buffer.states[OBS_IMAGE][:n].float() / 255.0, float_buffer.states[OBS_IMAGE][:n], rtol=0, atol=0
+    )
+    assert torch.equal(uint8_buffer.states[OBS_STATE][:n], float_buffer.states[OBS_STATE][:n])
+    assert torch.equal(uint8_buffer.actions[:n], float_buffer.actions[:n])
+
+    resaved = uint8_buffer.to_lerobot_dataset(DUMMY_REPO_ID, root=tmp_path / "resaved")
+    for i in range(n):
+        torch.testing.assert_close(resaved[i][OBS_IMAGE], ds[i][OBS_IMAGE], rtol=0, atol=1 / 255)

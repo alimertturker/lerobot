@@ -67,7 +67,14 @@
           "x": 0.02,
           "y": 0.02,
           "z": 0.02
-        }
+        },
+        "joint_step_sizes": {
+          "wrist_flex": 9.0,
+          "wrist_roll": 9.0
+        },
+        "joint_bounds": null,
+        "max_joint_step_deg": 9.0,
+        "max_ik_error_m": 0.005
       },
       "leader_intervention": {
         "pause_key": "space",
@@ -85,9 +92,9 @@
     }
   },
   "dataset": {
-    "repo_id": "local/so101_leader_demos",
+    "repo_id": "local/so101_leader_demos_wrist",
     "task": "Pick up the scotch tape",
-    "root": "outputs/datasets/so101_leader_demos",
+    "root": "outputs/datasets/so101_leader_demos_wrist",
     "num_episodes_to_record": 15,
     "push_to_hub": false
   },

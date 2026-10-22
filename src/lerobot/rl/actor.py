@@ -290,6 +290,12 @@ def act_with_policy(
         dataset_stats=cfg.policy.dataset_stats,
     )
 
+    # The policy above is untrained: act only once the learner's weights are loaded.
+    if not wait_for_policy_parameters(
+        algorithm=algorithm, parameters_queue=parameters_queue, device=device, shutdown_event=shutdown_event
+    ):
+        return
+
     transition = reset_and_build_transition(online_env, env_processor, action_processor)
 
     # NOTE: For the moment we will solely handle the case of a single environment
@@ -307,6 +313,9 @@ def act_with_policy(
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down act_with_policy")
             return
+
+        # Use new weights as soon as they arrive (as in HIL-SERL), not only at the end of an episode.
+        update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
 
         observation = {
             k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
@@ -387,8 +396,6 @@ def act_with_policy(
 
         if done or truncated:
             logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
 
             if len(list_transition_to_send_to_learner) > 0:
                 push_transitions_to_transport_queue(
@@ -697,6 +704,27 @@ def interactions_stream(
 
 
 #  Policy functions
+
+
+def wait_for_policy_parameters(
+    algorithm: RLAlgorithm, parameters_queue: Queue, device, shutdown_event: Any, log_every_s: float = 10.0
+) -> bool:
+    """Block until the learner's first weights arrive and load them. Returns False on shutdown."""
+    logging.info("[ACTOR] Waiting for the policy weights from the learner...")
+    start = last_log = time.perf_counter()
+    while not shutdown_event.is_set():
+        bytes_state_dict = get_last_item_from_queue(parameters_queue, block=True, timeout=0.5)
+        if bytes_state_dict is not None:
+            algorithm.load_weights(bytes_to_state_dict(bytes_state_dict), device=device)
+            logging.info(f"[ACTOR] Loaded the learner's weights after {time.perf_counter() - start:.0f} s.")
+            return True
+        if time.perf_counter() - last_log > log_every_s:
+            last_log = time.perf_counter()
+            logging.info(
+                f"[ACTOR] Still waiting for the learner's weights ({last_log - start:.0f} s); the learner "
+                "sends them every policy_parameters_push_frequency seconds, not while it saves a checkpoint."
+            )
+    return False
 
 
 def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, device):

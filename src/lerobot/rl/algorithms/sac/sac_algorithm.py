@@ -229,6 +229,7 @@ class SACAlgorithm(RLAlgorithm):
         stats = TrainingStats(
             losses={"loss_critic": loss_critic.item()},
             grad_norms={"critic": critic_grad},
+            extra={"q_mean": self._last_q_mean.item(), "td_target_mean": self._last_td_target_mean.item()},
         )
 
         if self.policy_config.num_discrete_actions is not None:
@@ -305,6 +306,7 @@ class SACAlgorithm(RLAlgorithm):
                 min_q = min_q - (self.temperature * next_log_probs)
 
             td_target = rewards + (1 - done) * self.config.discount * min_q
+            self._last_td_target_mean = td_target.mean()
 
         # 3- compute predicted qs
         if self.policy_config.num_discrete_actions is not None:
@@ -321,6 +323,7 @@ class SACAlgorithm(RLAlgorithm):
 
         # 4- Calculate loss
         # Compute state-action value loss (TD loss) for all of the Q functions in the ensemble.
+        self._last_q_mean = q_preds.detach().mean()
         td_target_duplicate = einops.repeat(td_target, "b -> e b", e=q_preds.shape[0])
         # You compute the mean loss of the batch for each critic and then to compute the final loss you sum them up
         critics_loss = (
@@ -498,24 +501,42 @@ class SACAlgorithm(RLAlgorithm):
     def get_optimizers(self) -> dict[str, Optimizer]:
         return self.optimizers
 
-    def get_weights(self) -> dict[str, Any]:
-        """Send actor + discrete-critic state dicts."""
-        state_dicts: dict[str, Any] = {
-            "policy": move_state_dict_to_device(self.policy.actor.state_dict(), device="cpu"),
-        }
-        if self.policy_config.num_discrete_actions is not None:
-            state_dicts["discrete_critic"] = move_state_dict_to_device(
-                self.policy.discrete_critic.state_dict(), device="cpu"
+    def _unsent_parameter_names(self, module: nn.Module) -> set[str]:
+        # A frozen *pretrained* vision backbone never changes and the actor loads the same one, so it is not
+        # sent: with ResNet-10 that is ~20 MB of the ~23 MB pushed to the actor. A frozen backbone without
+        # pretrained weights is random per process, so it is still sent.
+        if self.policy_config.vision_encoder_name is None:
+            return set()
+        return {name for name, param in module.named_parameters() if not param.requires_grad}
+
+    def _trainable_state_dict(self, module: nn.Module) -> dict[str, Tensor]:
+        unsent = self._unsent_parameter_names(module)
+        state = {k: v for k, v in module.state_dict().items() if k not in unsent}
+        return move_state_dict_to_device(state, device="cpu")
+
+    def _load_trainable_state_dict(self, module: nn.Module, state: dict[str, Tensor]) -> None:
+        result = module.load_state_dict(state, strict=False)
+        frozen = self._unsent_parameter_names(module)
+        missing = [k for k in result.missing_keys if k not in frozen]
+        if missing or result.unexpected_keys:
+            raise RuntimeError(
+                f"Weights from the learner do not match: missing {missing}, unexpected {result.unexpected_keys}"
             )
+
+    def get_weights(self) -> dict[str, Any]:
+        """Send actor + discrete-critic state dicts (without a frozen vision backbone)."""
+        state_dicts: dict[str, Any] = {"policy": self._trainable_state_dict(self.policy.actor)}
+        if self.policy_config.num_discrete_actions is not None:
+            state_dicts["discrete_critic"] = self._trainable_state_dict(self.policy.discrete_critic)
         return state_dicts
 
     def load_weights(self, weights: dict[str, Any], device: str | torch.device = "cpu") -> None:
         """Load actor + discrete-critic weights into the policy."""
         actor_sd = move_state_dict_to_device(weights["policy"], device=device)
-        self.policy.actor.load_state_dict(actor_sd)
+        self._load_trainable_state_dict(self.policy.actor, actor_sd)
         if "discrete_critic" in weights and self.policy.discrete_critic is not None:
             discrete_sd = move_state_dict_to_device(weights["discrete_critic"], device=device)
-            self.policy.discrete_critic.load_state_dict(discrete_sd)
+            self._load_trainable_state_dict(self.policy.discrete_critic, discrete_sd)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Algorithm-owned trainable tensors.

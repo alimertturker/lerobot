@@ -9,14 +9,15 @@
   "log_freq": 500,
   "save_checkpoint": true,
   "save_freq": 5000,
+  "buffer_save_freq": 20000,
   "wandb": {
     "enable": false,
     "project": "so100_real",
     "disable_artifact": true
   },
   "dataset": {
-    "repo_id": "local/so101_leader_demos",
-    "root": "outputs/datasets/so101_leader_demos",
+    "repo_id": "local/so101_leader_demos_wrist",
+    "root": "outputs/datasets/so101_leader_demos_wrist",
     "use_imagenet_stats": false
   },
   "algorithm": {
@@ -92,7 +93,7 @@
       "action": {
         "type": "ACTION",
         "shape": [
-          3
+          5
         ]
       }
     },
@@ -167,9 +168,13 @@
         "min": [
           -1.0,
           -1.0,
+          -1.0,
+          -1.0,
           -1.0
         ],
         "max": [
+          1.0,
+          1.0,
           1.0,
           1.0,
           1.0
@@ -206,7 +211,7 @@
     "actor_learner_config": {
       "learner_host": "127.0.0.1",
       "learner_port": 50051,
-      "policy_parameters_push_frequency": 50
+      "policy_parameters_push_frequency": 10
     },
     "concurrency": {
       "actor": "threads",
@@ -283,7 +288,14 @@
           "x": 0.02,
           "y": 0.02,
           "z": 0.02
-        }
+        },
+        "joint_step_sizes": {
+          "wrist_flex": 9.0,
+          "wrist_roll": 9.0
+        },
+        "joint_bounds": null,
+        "max_joint_step_deg": 9.0,
+        "max_ik_error_m": 0.005
       },
       "leader_intervention": {
         "pause_key": "space",
@@ -325,7 +337,7 @@
       "action": {
         "type": "ACTION",
         "shape": [
-          3
+          5
         ]
       }
     },

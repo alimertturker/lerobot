@@ -14,7 +14,7 @@
 
 """Push the project's datasets or trained policy to the Hugging Face Hub (private repos).
 
-  scripts/push_hub.sh demos     # outputs/datasets/so101_leader_demos -> $HF_USER/so101_leader_demos
+  scripts/push_hub.sh demos     # outputs/datasets/so101_leader_demos_wrist -> $HF_USER/so101_leader_demos_wrist
   scripts/push_hub.sh policy    # latest training checkpoint          -> $HF_USER/hilserl_so101_leader
 
 HF_USER comes from local.env (via push_hub.sh). Needs `hf auth login` once. Add --public to make the repo
@@ -32,7 +32,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 USER = os.environ.get("HF_USER", "")
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATASETS = {
-    "demos": "so101_leader_demos",
+    "demos": "so101_leader_demos_wrist",
 }
 POLICY_REPO = "hilserl_so101_leader"
 CHECKPOINTS = PROJECT_DIR / "outputs/train/hilserl_so101_leader/checkpoints"

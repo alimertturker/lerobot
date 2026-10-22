@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -102,6 +103,7 @@ class RobotKinematics:
         position_weight: float = 1.0,
         orientation_weight: float = 0.01,
         max_iters: int = 8,
+        locked_joints: Sequence[str] = (),
     ) -> np.ndarray:
         """
         Compute inverse kinematics using placo solver.
@@ -112,6 +114,8 @@ class RobotKinematics:
             position_weight: Weight for position constraint in IK
             orientation_weight: Weight for orientation constraint in IK, set to 0.0 to only constrain position
             max_iters: Number of placo Newton steps to run.
+            locked_joints: Joints the solver must not move; they keep their value from `current_joint_pos`,
+                even outside the URDF joint limits.
 
         Returns:
             Joint positions in degrees that achieve the desired end-effector pose
@@ -130,10 +134,21 @@ class RobotKinematics:
         # Configure the task based on position_only flag
         self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
 
-        # Solve IK.
-        for _ in range(max_iters):
-            self.solver.solve(True)
-            self.robot.update_kinematics()
+        # Solve IK. A locked joint outside its URDF limits (the real range can be wider) would make the
+        # problem infeasible, so its limits are widened to include its value for this solve.
+        urdf_limits = {joint_name: self.robot.get_joint_limits(joint_name) for joint_name in locked_joints}
+        for joint_name, (low, high) in urdf_limits.items():
+            value = self.robot.get_joint(joint_name)
+            self.robot.set_joint_limits(joint_name, min(low, value), max(high, value))
+            self.solver.mask_dof(joint_name)
+        try:
+            for _ in range(max_iters):
+                self.solver.solve(True)
+                self.robot.update_kinematics()
+        finally:
+            for joint_name, (low, high) in urdf_limits.items():
+                self.solver.unmask_dof(joint_name)
+                self.robot.set_joint_limits(joint_name, low, high)
 
         # Extract joint positions
         joint_pos_rad = []

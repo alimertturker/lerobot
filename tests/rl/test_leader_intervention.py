@@ -174,6 +174,16 @@ def test_ee_delta_action_scales_clips_and_maps_gripper():
     assert action[-1] == GRIPPER_INCREASE
 
 
+def test_ee_delta_action_appends_joint_deltas_before_the_gripper():
+    follower = joints(gripper=50.0)
+    leader = joints(wrist_flex=4.5, wrist_roll=-20.0, gripper=60.0)
+    steps = {"wrist_flex": 9.0, "wrist_roll": 9.0}
+    action = ee_delta_action_from_joints(
+        FakeKinematics(), MOTORS, follower, leader, STEP_SIZES, True, 3.0, joint_step_sizes=steps
+    )
+    np.testing.assert_allclose(action, [0.0, 0.0, 0.0, 0.5, -1.0, GRIPPER_INCREASE], atol=1e-6)
+
+
 def test_autonomous_passes_policy_action_and_leaves_leader_alone(setup):
     leader, _, step, pipeline, resets = setup
     leader.position = joints(30.0)  # far from the follower: must not matter

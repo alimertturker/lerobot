@@ -10,7 +10,7 @@ PYTHONUNBUFFERED=1 "$PY" -m lerobot.rl.gym_manipulator --config_path "$PROJECT_D
   "${SETUP_ARGS[@]}" "$@" \
   2>&1 | tee "$PROJECT_DIR/outputs/record_demos.log"
 
-# Upload the recorded episodes to $HF_USER/so101_leader_demos (private). Skipped when HF_USER is empty
+# Upload the recorded episodes to $HF_USER/so101_leader_demos_wrist (private). Skipped when HF_USER is empty
 # or with NO_PUSH=1.
 if [ -n "${HF_USER:-}" ] && [ -z "${NO_PUSH:-}" ]; then
   "$PROJECT_DIR/scripts/push_hub.sh" demos

@@ -258,6 +258,16 @@ class InverseKinematicsConfig:
     target_frame_name: str | None = None
     end_effector_bounds: dict[str, list[float]] | None = None
     end_effector_step_sizes: dict[str, float] | None = None
+    # Joints the policy commands directly as joint deltas, in degrees per unit of action (e.g.
+    # {"wrist_flex": 9.0, "wrist_roll": 9.0}). They follow the xyz part of the action, before the gripper; IK
+    # then moves the other joints to keep the tip on its xyz target. None = xyz only.
+    joint_step_sizes: dict[str, float] | None = None
+    # Optional [min, max] in degrees for the joints in `joint_step_sizes`.
+    joint_bounds: dict[str, list[float]] | None = None
+    # Policy-motion limits: no joint moves more than `max_joint_step_deg` per step and IK must reach the target
+    # within `max_ik_error_m`; otherwise the step is shrunk, or the previous command held. None = no limit.
+    max_joint_step_deg: float | None = None
+    max_ik_error_m: float | None = None
 
 
 @dataclass

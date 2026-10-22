@@ -308,6 +308,7 @@ def add_actor_information_and_train(
     fps = cfg.env.fps
     log_freq = cfg.log_freq
     save_freq = cfg.save_freq
+    buffer_save_freq = cfg.buffer_save_freq
     policy_parameters_push_frequency = cfg.policy.actor_learner_config.policy_parameters_push_frequency
     saving_checkpoint = cfg.save_checkpoint
     online_steps = cfg.policy.online_steps
@@ -322,10 +323,7 @@ def add_actor_information_and_train(
 
     logging.info("Initializing policy")
 
-    policy = make_policy(
-        cfg=cfg.policy,
-        env_cfg=cfg.env,
-    )
+    policy = make_learner_policy(cfg)
 
     assert isinstance(policy, nn.Module)
 
@@ -385,6 +383,28 @@ def add_actor_information_and_train(
     if cfg.dataset is not None:
         dataset_repo_id = cfg.dataset.repo_id
 
+    def save(step: int, save_buffers: bool) -> None:
+        save_training_checkpoint(
+            cfg=cfg,
+            optimization_step=step,
+            online_steps=online_steps,
+            interaction_message=interaction_message,
+            policy=policy,
+            optimizers=optimizers,
+            replay_buffer=replay_buffer,
+            algorithm=algorithm,
+            offline_replay_buffer=offline_replay_buffer,
+            dataset_repo_id=dataset_repo_id,
+            fps=fps,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            save_buffers=save_buffers,
+        )
+
+    last_buffer_save_step = optimization_step
+    metric_sums: dict[str, float] = {}
+    metric_count = 0
+
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
         # Exit the training loop if shutdown is requested
@@ -424,10 +444,18 @@ def add_actor_information_and_train(
             last_time_policy_pushed = time.time()
 
         training_infos = stats.to_log_dict()
+        for name, value in training_infos.items():
+            metric_sums[name] = metric_sums.get(name, 0.0) + value
+        metric_count += 1
 
         # Log training metrics at specified intervals
         optimization_step = algorithm.optimization_step
         if optimization_step % log_freq == 0:
+            log_training_metrics(
+                optimization_step, metric_sums, metric_count, replay_buffer, offline_replay_buffer
+            )
+            metric_sums, metric_count = {}, 0
+
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
@@ -459,21 +487,50 @@ def add_actor_information_and_train(
 
         # Save checkpoint at specified intervals
         if saving_checkpoint and should_save_checkpoint(optimization_step, save_freq, online_steps):
-            save_training_checkpoint(
-                cfg=cfg,
-                optimization_step=optimization_step,
-                online_steps=online_steps,
-                interaction_message=interaction_message,
-                policy=policy,
-                optimizers=optimizers,
-                replay_buffer=replay_buffer,
-                algorithm=algorithm,
-                offline_replay_buffer=offline_replay_buffer,
-                dataset_repo_id=dataset_repo_id,
-                fps=fps,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-            )
+            save_buffers = buffer_save_freq is None or optimization_step % buffer_save_freq == 0
+            save(optimization_step, save_buffers=save_buffers)
+            if save_buffers:
+                last_buffer_save_step = optimization_step
+
+    # Without buffers at every checkpoint, keep what was collected since the last buffer save.
+    if saving_checkpoint and buffer_save_freq is not None and optimization_step > last_buffer_save_step:
+        logging.info(
+            f"[LEARNER] Saving a final checkpoint at step {optimization_step} with the replay buffers (last saved "
+            f"at step {last_buffer_save_step}); this takes a few minutes, Ctrl+C again skips it."
+        )
+        save(optimization_step, save_buffers=True)
+
+
+def log_training_metrics(
+    step: int,
+    metric_sums: dict[str, float],
+    metric_count: int,
+    replay_buffer: ReplayBuffer,
+    offline_replay_buffer: ReplayBuffer | None,
+) -> None:
+    """Log the training metrics averaged since the last call, so the run can be followed without wandb."""
+    if metric_count == 0:
+        return
+    mean = {name: total / metric_count for name, total in metric_sums.items()}
+    parts = [f"{name} {mean[name]:.4g}" for name in LOGGED_METRICS if name in mean]
+    buffers = f"online {len(replay_buffer)}"
+    if offline_replay_buffer is not None:
+        buffers += f", offline {len(offline_replay_buffer)}"
+    logging.info(f"[LEARNER] step {step} (mean of {metric_count}): {' | '.join(parts)} | buffers {buffers}")
+
+
+# Metrics in the learner log, in this order (all of them still go to wandb when it is on).
+LOGGED_METRICS = (
+    "loss_critic",
+    "q_mean",
+    "td_target_mean",
+    "loss_actor",
+    "loss_discrete_critic",
+    "temperature",
+    "loss_temperature",
+    "critic_grad_norm",
+    "actor_grad_norm",
+)
 
 
 def start_learner(
@@ -560,6 +617,7 @@ def save_training_checkpoint(
     fps: int = 30,
     preprocessor=None,
     postprocessor=None,
+    save_buffers: bool = True,
 ) -> None:
     """
     Save training checkpoint and associated data.
@@ -585,6 +643,7 @@ def save_training_checkpoint(
         fps: Frames per second for dataset
         preprocessor: Optional preprocessor pipeline to save
         postprocessor: Optional postprocessor pipeline to save
+        save_buffers: Whether to save the replay buffers (steps 5 and 6)
     """
     logging.info(f"Checkpoint policy after step {optimization_step}")
     _num_digits = max(6, len(str(online_steps)))
@@ -621,33 +680,66 @@ def save_training_checkpoint(
     # Update the "last" symlink
     update_last_checkpoint(checkpoint_dir)
 
+    if not save_buffers:
+        logging.info("Resume training (replay buffers not saved at this checkpoint)")
+        return
+
     # TODO : temporary save replay buffer here, remove later when on the robot
     # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
-
     # Save dataset
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    _save_buffer_atomically(replay_buffer, repo_id_buffer_save, fps, os.path.join(cfg.output_dir, "dataset"))
 
     if offline_replay_buffer is not None:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
-
-        offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
-            fps=fps,
-            root=dataset_offline_dir,
+        _save_buffer_atomically(
+            offline_replay_buffer, cfg.dataset.repo_id, fps, os.path.join(cfg.output_dir, "dataset_offline")
         )
 
     logging.info("Resume training")
 
 
+def _save_buffer_atomically(buffer: ReplayBuffer, repo_id: str, fps: int, dataset_dir: str) -> None:
+    """Write the buffer next to the previous copy, then swap them, so an interrupted save (e.g. a second
+    Ctrl+C) leaves the previous copy intact for `--resume`."""
+    tmp_dir = dataset_dir + ".tmp"
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    buffer.to_lerobot_dataset(repo_id=repo_id, fps=fps, root=tmp_dir)
+    if os.path.isdir(dataset_dir):
+        shutil.rmtree(dataset_dir)
+    os.replace(tmp_dir, dataset_dir)
+
+
 # Training setup functions
+
+
+# (config, field) pairs taken from the given config instead of the checkpoint's when resuming.
+RESUME_RUNTIME_SETTINGS = (
+    ("train", "save_checkpoint"),
+    ("train", "save_freq"),
+    ("train", "buffer_save_freq"),
+    ("train", "log_freq"),
+    ("train", "wandb"),
+    ("policy", "actor_learner_config"),
+)
+
+
+def make_learner_policy(cfg: TrainRLServerPipelineConfig) -> nn.Module:
+    """Build the policy; on resume, with the weights of the last checkpoint.
+
+    The checkpoint's config does not point at its own weights, so they are loaded explicitly. Otherwise the
+    actor, the trainable encoder layers and the discrete critic would start from scratch while the critic
+    heads, optimizers and temperature are restored from the checkpoint.
+    """
+    resume_policy_path = None
+    if cfg.resume:
+        resume_policy_path = os.path.join(
+            cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK, PRETRAINED_MODEL_DIR
+        )
+        logging.info(f"Restoring the policy weights from {resume_policy_path}")
+    return make_policy(cfg=cfg.policy, env_cfg=cfg.env, pretrained_path=resume_policy_path)
 
 
 def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipelineConfig:
@@ -656,7 +748,7 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
 
     If resume is True:
     - Verifies that a checkpoint exists
-    - Loads the checkpoint configuration
+    - Loads the checkpoint configuration, keeping the given run settings (RESUME_RUNTIME_SETTINGS)
     - Logs resumption details
     - Returns the checkpoint configuration
 
@@ -701,6 +793,15 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     # Load config using Draccus
     checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
+
+    # Settings that only drive the run (saving, logging, weight pushes), not the model or the data, come from
+    # the config given now, so they can be changed between restarts.
+    for owner, name in RESUME_RUNTIME_SETTINGS:
+        given = cfg.policy if owner == "policy" else cfg
+        resumed = checkpoint_cfg.policy if owner == "policy" else checkpoint_cfg
+        if getattr(resumed, name) != getattr(given, name):
+            logging.info(f"Resume: {name} = {getattr(given, name)} (checkpoint had {getattr(resumed, name)})")
+        setattr(resumed, name, getattr(given, name))
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
@@ -811,6 +912,7 @@ def initialize_replay_buffer(
             state_keys=cfg.policy.input_features.keys(),
             storage_device=storage_device,
             optimize_memory=True,
+            store_images_as_uint8=True,
         )
 
     logging.info("Resume training load the online dataset")
@@ -830,6 +932,7 @@ def initialize_replay_buffer(
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         optimize_memory=True,
+        store_images_as_uint8=True,
     )
 
 
@@ -867,6 +970,7 @@ def initialize_offline_replay_buffer(
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
         optimize_memory=True,
+        store_images_as_uint8=True,
         capacity=cfg.policy.offline_buffer_capacity,
     )
     return offline_replay_buffer

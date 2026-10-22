@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -199,7 +200,8 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
 
     Attributes:
         end_effector_bounds: A dictionary with "min" and "max" keys for position clipping.
-        max_ee_step_m: The maximum allowed change in position (in meters) between steps.
+        max_ee_step_m: The maximum allowed change in position (in meters) between steps; None skips this check
+            (e.g. when the IK step limits the joint motion instead).
         raise_on_jump: When ``True`` (default) an over-limit per-frame step raises
             ``ValueError`` (aborting the control loop). When ``False`` the step is
             rate-limited to ``max_ee_step_m`` and a warning is logged instead — the
@@ -209,7 +211,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
     """
 
     end_effector_bounds: dict
-    max_ee_step_m: float = 0.05
+    max_ee_step_m: float | None = 0.05
     raise_on_jump: bool = True
     _last_pos: np.ndarray | None = field(default=None, init=False, repr=False)
 
@@ -234,7 +236,7 @@ class EEBoundsAndSafety(RobotActionProcessorStep):
         pos = np.clip(pos, self.end_effector_bounds["min"], self.end_effector_bounds["max"])
 
         # Check for jumps in position
-        if self._last_pos is not None:
+        if self._last_pos is not None and self.max_ee_step_m is not None:
             dpos = pos - self._last_pos
             n = float(np.linalg.norm(dpos))
             if n > self.max_ee_step_m and n > 0:
@@ -563,12 +565,26 @@ class InverseKinematicsRLStep(ProcessorStep):
     Computes desired joint positions from a target end-effector pose using inverse kinematics (IK).
 
     This is modified from the InverseKinematicsEEToJoints step to be used in the RL pipeline.
+
+    Joints in `joint_step_sizes` are commanded directly: `joint_delta.<joint>` (in units of action) times the
+    step size in degrees is added to the previous IK solution, clipped to `joint_bounds`, and those joints are
+    locked while IK moves the others to reach the end-effector position (orientation is then ignored).
+
+    With `max_joint_step_deg` or `max_ik_error_m` set, a step is only sent if every joint moves at most
+    `max_joint_step_deg` from the previous command and IK reaches the target within `max_ik_error_m`. Otherwise
+    the whole step (end-effector move and joint deltas together) is shrunk to 1/2, 1/4 and 1/8, which keeps the
+    tip on the straight line towards the target; if none of these works the previous command is held.
     """
 
     kinematics: RobotKinematics
     motor_names: list[str]
     q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
+    joint_step_sizes: dict[str, float] = field(default_factory=dict)
+    joint_bounds: dict[str, list[float]] = field(default_factory=dict)
+    max_joint_step_deg: float | None = None
+    max_ik_error_m: float | None = None
+    _last_hold_warning: float = field(default=float("-inf"), init=False, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
@@ -584,6 +600,9 @@ class InverseKinematicsRLStep(ProcessorStep):
         wy = action.pop("ee.wy")
         wz = action.pop("ee.wz")
         gripper_pos = action.pop("ee.gripper_pos")
+        joint_deltas = {
+            joint: float(action.pop(f"joint_delta.{joint}", 0.0)) for joint in self.joint_step_sizes
+        }
 
         if None in (x, y, z, wx, wy, wz, gripper_pos):
             raise ValueError(
@@ -615,7 +634,10 @@ class InverseKinematicsRLStep(ProcessorStep):
         t_des[:3, 3] = [x, y, z]
 
         # Compute inverse kinematics
-        q_target = self.kinematics.inverse_kinematics(self.q_curr, t_des)
+        if self.max_joint_step_deg is None and self.max_ik_error_m is None:
+            q_target = self._solve(np.array(self.q_curr, dtype=float), t_des, joint_deltas)
+        else:
+            q_target = self._limited_step(np.array(self.q_curr, dtype=float), t_des, joint_deltas)
         self.q_curr = q_target
 
         # TODO: This is sentitive to order of motor_names = q_target mapping
@@ -633,11 +655,59 @@ class InverseKinematicsRLStep(ProcessorStep):
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
         return new_transition
 
+    def _solve(self, q_prev: np.ndarray, t_des: np.ndarray, joint_deltas: dict[str, float]) -> np.ndarray:
+        """IK towards `t_des`, with the commanded joints moved by their deltas and locked."""
+        if not self.joint_step_sizes:
+            return self.kinematics.inverse_kinematics(q_prev, t_des)
+        q_guess = q_prev.copy()
+        for joint, delta in joint_deltas.items():
+            i = self.motor_names.index(joint)
+            q_guess[i] += delta * self.joint_step_sizes[joint]
+            if joint in self.joint_bounds:
+                # A joint left outside its bounds (e.g. by a take-over) is not snapped back in one step: it may
+                # stay where it is or move towards the bounds.
+                low, high = self.joint_bounds[joint]
+                q_guess[i] = float(np.clip(q_guess[i], min(low, q_prev[i]), max(high, q_prev[i])))
+        return self.kinematics.inverse_kinematics(
+            q_guess, t_des, orientation_weight=0.0, locked_joints=tuple(self.joint_step_sizes)
+        )
+
+    def _limited_step(
+        self, q_prev: np.ndarray, t_des: np.ndarray, joint_deltas: dict[str, float]
+    ) -> np.ndarray:
+        """Largest of the full, 1/2, 1/4 and 1/8 step that respects the joint-step and IK-error limits."""
+        arm = [i for i, name in enumerate(self.motor_names) if name != "gripper"]
+        p_prev = self.kinematics.forward_kinematics(q_prev)[:3, 3]
+        for scale in (1.0, 0.5, 0.25, 0.125):
+            t_step = t_des.copy()
+            t_step[:3, 3] = p_prev + scale * (t_des[:3, 3] - p_prev)
+            q = self._solve(q_prev, t_step, {joint: scale * d for joint, d in joint_deltas.items()})
+            ik_error = float(np.linalg.norm(self.kinematics.forward_kinematics(q)[:3, 3] - t_step[:3, 3]))
+            steps = np.abs(q[arm] - q_prev[arm])
+            joint_step = float(np.max(steps))
+            if (self.max_ik_error_m is None or ik_error <= self.max_ik_error_m) and (
+                self.max_joint_step_deg is None or joint_step <= self.max_joint_step_deg + 1e-6
+            ):
+                return q
+        now = time.monotonic()
+        if now - self._last_hold_warning > 2.0:
+            self._last_hold_warning = now
+            logger.warning(
+                "IK could not reach the target within the limits (error %.1f mm, %s step %.1f deg); "
+                "holding the previous command.",
+                1000 * ik_error,
+                self.motor_names[arm[int(np.argmax(steps))]],
+                joint_step,
+            )
+        return q_prev
+
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         for feat in ["x", "y", "z", "wx", "wy", "wz", "gripper_pos"]:
             features[PipelineFeatureType.ACTION].pop(f"ee.{feat}", None)
+        for joint in self.joint_step_sizes:
+            features[PipelineFeatureType.ACTION].pop(f"joint_delta.{joint}", None)
 
         for name in self.motor_names:
             features[PipelineFeatureType.ACTION][f"{name}.pos"] = PolicyFeature(

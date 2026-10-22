@@ -16,7 +16,7 @@
 
 import functools
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
 from typing import NotRequired, TypedDict
 
@@ -37,6 +37,13 @@ class BatchTransition(TypedDict):
     done: torch.Tensor
     truncated: torch.Tensor
     complementary_info: NotRequired[dict[str, torch.Tensor | float | int] | None]
+
+
+def _float_image_to_uint8(value: torch.Tensor) -> torch.Tensor:
+    """Inverse of `_uint8_image_to_float`; exact for images that came from uint8 cameras or files."""
+    if value.dtype == torch.uint8:
+        return value
+    return (value * 255.0).round_().clamp_(0, 255).to(torch.uint8)
 
 
 def _uint8_image_to_float(value: torch.Tensor) -> torch.Tensor:
@@ -96,6 +103,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        store_images_as_uint8: bool = False,
     ):
         """
         Replay buffer for storing transitions.
@@ -113,6 +121,9 @@ class ReplayBuffer:
                 Using "cpu" can help save GPU memory.
             optimize_memory (bool): If True, optimizes memory by not storing duplicate next_states when
                 they can be derived from states. This is useful for large datasets where next_state[i] = state[i+1].
+            store_images_as_uint8 (bool): If True, image states (keys starting with `observation.image`) are
+                stored as uint8 (4x less memory than float32) and turned back into float in [0, 1] when
+                sampling. Images in [0, 1] that came from uint8 cameras or files round-trip exactly.
         """
         if capacity <= 0:
             raise ValueError("Capacity must be greater than 0.")
@@ -124,6 +135,7 @@ class ReplayBuffer:
         self.size = 0
         self.initialized = False
         self.optimize_memory = optimize_memory
+        self.store_images_as_uint8 = store_images_as_uint8
         self._lock = threading.Lock()
 
         # Track episode boundaries for memory optimization
@@ -152,7 +164,9 @@ class ReplayBuffer:
 
         # Pre-allocate tensors for storage
         self.states = {
-            key: torch.empty((self.capacity, *shape), device=self.storage_device)
+            key: torch.empty(
+                (self.capacity, *shape), device=self.storage_device, dtype=self._state_dtype(key)
+            )
             for key, shape in state_shapes.items()
         }
         self.actions = torch.empty((self.capacity, *action_shape), device=self.storage_device)
@@ -161,7 +175,9 @@ class ReplayBuffer:
         if not self.optimize_memory:
             # Standard approach: store states and next_states separately
             self.next_states = {
-                key: torch.empty((self.capacity, *shape), device=self.storage_device)
+                key: torch.empty(
+                    (self.capacity, *shape), device=self.storage_device, dtype=self._state_dtype(key)
+                )
                 for key, shape in state_shapes.items()
             }
         else:
@@ -194,6 +210,19 @@ class ReplayBuffer:
 
         self.initialized = True
 
+    def _state_dtype(self, key: str) -> torch.dtype:
+        if self.store_images_as_uint8 and key.startswith(OBS_IMAGE):
+            return torch.uint8
+        return torch.float32
+
+    def _to_storage(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        if self.states[key].dtype == torch.uint8:
+            return _float_image_to_uint8(value)
+        return value
+
+    def _from_storage(self, value: torch.Tensor) -> torch.Tensor:
+        return _uint8_image_to_float(value)
+
     def __len__(self):
         return self.size
 
@@ -215,11 +244,13 @@ class ReplayBuffer:
 
             # Store the transition in pre-allocated tensors
             for key in self.states:
-                self.states[key][self.position].copy_(state[key].squeeze(dim=0))
+                self.states[key][self.position].copy_(self._to_storage(key, state[key].squeeze(dim=0)))
 
                 if not self.optimize_memory:
                     # Only store next_states if not optimizing memory
-                    self.next_states[key][self.position].copy_(next_state[key].squeeze(dim=0))
+                    self.next_states[key][self.position].copy_(
+                        self._to_storage(key, next_state[key].squeeze(dim=0))
+                    )
 
             self.actions[self.position].copy_(action.squeeze(dim=0))
             self.rewards[self.position] = reward
@@ -256,13 +287,13 @@ class ReplayBuffer:
             batch_next_state = {}
 
             for key in self.states:
-                batch_state[key] = self.states[key][idx].to(self.device)
+                batch_state[key] = self._from_storage(self.states[key][idx].to(self.device))
 
                 if not self.optimize_memory:
-                    batch_next_state[key] = self.next_states[key][idx].to(self.device)
+                    batch_next_state[key] = self._from_storage(self.next_states[key][idx].to(self.device))
                 else:
                     next_idx = (idx + 1) % self.capacity
-                    batch_next_state[key] = self.states[key][next_idx].to(self.device)
+                    batch_next_state[key] = self._from_storage(self.states[key][next_idx].to(self.device))
 
             # Sample other tensors
             batch_actions = self.actions[idx].to(self.device)
@@ -426,6 +457,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        store_images_as_uint8: bool = False,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -441,6 +473,7 @@ class ReplayBuffer:
             use_drq (bool): Whether to use DrQ image augmentation when sampling.
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+            store_images_as_uint8 (bool): If True, stores images as uint8 (see `ReplayBuffer`).
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -462,33 +495,12 @@ class ReplayBuffer:
             use_drq=use_drq,
             storage_device=storage_device,
             optimize_memory=optimize_memory,
+            store_images_as_uint8=store_images_as_uint8,
         )
 
-        # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
-
-        # Initialize the buffer with the first transition to set up storage tensors
-        if list_transition:
-            first_transition = list_transition[0]
-            first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
-            first_action = first_transition[ACTION].to(device)
-
-            # Get complementary info if available
-            first_complementary_info = None
-            if (
-                "complementary_info" in first_transition
-                and first_transition["complementary_info"] is not None
-            ):
-                first_complementary_info = {
-                    k: v.to(device) for k, v in first_transition["complementary_info"].items()
-                }
-
-            replay_buffer._initialize_storage(
-                state=first_state, action=first_action, complementary_info=first_complementary_info
-            )
-
-        # Fill the buffer with all transitions
-        for data in list_transition:
+        # Add the transitions one by one: building the whole list first holds every frame (and its next
+        # frame) as float32 at once, which needs several times the buffer's memory.
+        for data in cls._iter_lerobotdataset_transitions(dataset=lerobot_dataset, state_keys=state_keys):
             for k, v in data.items():
                 if isinstance(v, dict):
                     for key, tensor in v.items():
@@ -496,11 +508,9 @@ class ReplayBuffer:
                 elif isinstance(v, torch.Tensor):
                     data[k] = v.to(storage_device)
 
-            action = data[ACTION]
-
             replay_buffer.add(
                 state=data["state"],
-                action=action,
+                action=data[ACTION],
                 reward=data["reward"],
                 next_state=data["next_state"],
                 done=data["done"],
@@ -578,7 +588,7 @@ class ReplayBuffer:
 
             # Fill the data for state keys
             for key in self.states:
-                frame_dict[key] = self.states[key][actual_idx].cpu()
+                frame_dict[key] = self._from_storage(self.states[key][actual_idx].cpu())
 
             # Fill action, reward, done
             frame_dict[ACTION] = self.actions[actual_idx].cpu()
@@ -615,13 +625,23 @@ class ReplayBuffer:
 
         return lerobot_dataset
 
-    @staticmethod
+    @classmethod
     def _lerobotdataset_to_transitions(
+        cls,
         dataset: LeRobotDataset,
         state_keys: Sequence[str] | None = None,
     ) -> list[Transition]:
+        """Convert a LeRobotDataset into a list of RL (s, a, r, s', done) transitions; see
+        `_iter_lerobotdataset_transitions`."""
+        return list(cls._iter_lerobotdataset_transitions(dataset=dataset, state_keys=state_keys))
+
+    @staticmethod
+    def _iter_lerobotdataset_transitions(
+        dataset: LeRobotDataset,
+        state_keys: Sequence[str] | None = None,
+    ) -> Iterator[Transition]:
         """
-        Convert a LeRobotDataset into a list of RL (s, a, r, s', done) transitions.
+        Yield the RL (s, a, r, s', done) transitions of a LeRobotDataset one by one.
 
         Args:
             dataset (LeRobotDataset):
@@ -642,17 +662,24 @@ class ReplayBuffer:
                 If None, you must handle or define default keys.
 
         Returns:
-            transitions (list[Transition]):
-                A list of Transition dictionaries with the same length as `dataset`.
+            Transition dictionaries, one per frame of `dataset`.
         """
         if state_keys is None:
             raise ValueError("State keys must be provided when converting LeRobotDataset to Transitions.")
 
-        transitions = []
         num_frames = len(dataset)
 
+        # Each frame is also the previous frame's next frame: keep the last one so it is decoded once.
+        cached: dict = {}
+
+        def get_frame(index: int) -> dict:
+            if index not in cached:
+                cached.clear()
+                cached[index] = dataset[index]
+            return cached[index]
+
         # Check if the dataset has "next.done" key
-        sample = dataset[0]
+        sample = get_frame(0)
         has_done_key = DONE in sample
 
         # Check for complementary_info keys
@@ -664,7 +691,7 @@ class ReplayBuffer:
             print("'next.done' key not found in dataset. Inferring from episode boundaries...")
 
         for i in tqdm(range(num_frames)):
-            current_sample = dataset[i]
+            current_sample = get_frame(i)
 
             # ----- 1) Current state -----
             current_state: dict[str, torch.Tensor] = {}
@@ -687,7 +714,7 @@ class ReplayBuffer:
                 if i == num_frames - 1:
                     done = True
                 elif i < num_frames - 1:
-                    next_sample = dataset[i + 1]
+                    next_sample = get_frame(i + 1)
                     if next_sample["episode_index"] != current_sample["episode_index"]:
                         done = True
 
@@ -699,7 +726,7 @@ class ReplayBuffer:
             # Otherwise (done=True or next sample crosses to a new episode), next_state = current_state.
             next_state = current_state  # default
             if not done and (i < num_frames - 1):
-                next_sample = dataset[i + 1]
+                next_sample = get_frame(i + 1)
                 if next_sample["episode_index"] == current_sample["episode_index"]:
                     # Build next_state from the same keys
                     next_state_data: dict[str, torch.Tensor] = {}
@@ -725,7 +752,7 @@ class ReplayBuffer:
                         complementary_info[clean_key] = val
 
             # ----- Construct the Transition -----
-            transition = Transition(
+            yield Transition(
                 state=current_state,
                 action=action,
                 reward=reward,
@@ -734,9 +761,6 @@ class ReplayBuffer:
                 truncated=truncated,
                 complementary_info=complementary_info,
             )
-            transitions.append(transition)
-
-        return transitions
 
 
 # Utility function to guess shapes/dtypes from a tensor

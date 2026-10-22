@@ -19,7 +19,7 @@ fi
 export PATH="$(dirname "$PY"):$PATH"
 
 URDF="$PROJECT_DIR/assets/SO101/so101_new_calib.urdf"
-DATASET_NAME="so101_leader_demos"
+DATASET_NAME="so101_leader_demos_wrist"  # xyz + wrist actions (6-dim); the xyz-only demos stay in so101_leader_demos
 DATASET_ROOT="$PROJECT_DIR/outputs/datasets/$DATASET_NAME"
 DATASET_REPO_ID="${HF_USER:-local}/$DATASET_NAME"
 TRAIN_DIR="$PROJECT_DIR/outputs/train/hilserl_so101_leader"
@@ -44,6 +44,13 @@ SETUP_ARGS=(
   --dataset.repo_id="$DATASET_REPO_ID"
   --dataset.root="$DATASET_ROOT"
 )
+
+# Optional wrist limits for the policy, [min, max] degrees each (see local.env.example).
+if [ -n "${WRIST_FLEX_RANGE:-}" ] && [ -n "${WRIST_ROLL_RANGE:-}" ]; then
+  SETUP_ARGS+=(
+    --env.processor.inverse_kinematics.joint_bounds="{\"wrist_flex\": $WRIST_FLEX_RANGE, \"wrist_roll\": $WRIST_ROLL_RANGE}"
+  )
+fi
 
 if [ -n "${CALIBRATION_DIR:-}" ]; then
   SETUP_ARGS+=(

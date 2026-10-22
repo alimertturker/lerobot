@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -35,11 +35,14 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     end-effector (x, y, z) and optionally the gripper.
 
     Attributes:
-        use_gripper: If True, assumes the 4th element of the tensor is the
+        use_gripper: If True, assumes the element after the xyz (and joint) deltas is the
                      gripper action.
+        joint_names: Joints commanded directly as joint deltas; their elements follow x, y, z
+                     and become `delta_<joint>` entries.
     """
 
     use_gripper: bool = True
+    joint_names: tuple[str, ...] = field(default_factory=tuple)
 
     def action(self, action: PolicyAction) -> RobotAction:
         if not isinstance(action, torch.Tensor):
@@ -54,8 +57,10 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
             "delta_y": action[1].item(),
             "delta_z": action[2].item(),
         }
+        for i, joint in enumerate(self.joint_names):
+            delta_action[f"delta_{joint}"] = action[3 + i].item()
         if self.use_gripper:
-            delta_action["gripper"] = action[3].item()
+            delta_action["gripper"] = action[3 + len(self.joint_names)].item()
         return delta_action
 
     def transform_features(
@@ -63,6 +68,10 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         for axis in ["x", "y", "z"]:
             features[PipelineFeatureType.ACTION][f"delta_{axis}"] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(1,)
+            )
+        for joint in self.joint_names:
+            features[PipelineFeatureType.ACTION][f"delta_{joint}"] = PolicyFeature(
                 type=FeatureType.ACTION, shape=(1,)
             )
 
@@ -87,11 +96,13 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         position_scale: A factor to scale the delta position inputs.
         noise_threshold: The magnitude below which delta inputs are considered noise
                          and do not trigger an "enabled" state.
+        joint_names: Joints commanded directly; `delta_<joint>` is passed on as `joint_delta.<joint>`.
     """
 
     # Scale factors for delta movements
     position_scale: float = 1.0
     noise_threshold: float = 1e-3  # 1 mm threshold to filter out noise
+    joint_names: tuple[str, ...] = field(default_factory=tuple)
 
     def action(self, action: RobotAction) -> RobotAction:
         # NOTE (maractingi): Action can be a dict from the teleop_devices or a tensor from the policy
@@ -100,11 +111,13 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         delta_y = action.pop("delta_y")
         delta_z = action.pop("delta_z")
         gripper = action.pop("gripper")
+        joint_deltas = {joint: float(action.pop(f"delta_{joint}")) for joint in self.joint_names}
 
         # Determine if the teleoperator is actively providing input
         # Consider enabled if any significant movement delta is detected
         position_magnitude = (delta_x**2 + delta_y**2 + delta_z**2) ** 0.5  # Use Euclidean norm for position
         enabled = position_magnitude > self.noise_threshold  # Small threshold to avoid noise
+        enabled = enabled or any(abs(delta) > self.noise_threshold for delta in joint_deltas.values())
 
         # Scale the deltas appropriately
         scaled_delta_x = delta_x * self.position_scale
@@ -128,6 +141,8 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
             "target_wz": target_wz,
             "gripper_vel": float(gripper),
         }
+        for joint, delta in joint_deltas.items():
+            action[f"joint_delta.{joint}"] = delta
 
         return action
 
@@ -137,6 +152,11 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         for axis in ["x", "y", "z"]:
             features[PipelineFeatureType.ACTION].pop(f"delta_{axis}", None)
         features[PipelineFeatureType.ACTION].pop("gripper", None)
+        for joint in self.joint_names:
+            features[PipelineFeatureType.ACTION].pop(f"delta_{joint}", None)
+            features[PipelineFeatureType.ACTION][f"joint_delta.{joint}"] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(1,)
+            )
 
         for feat in [
             "enabled",

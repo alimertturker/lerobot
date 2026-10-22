@@ -33,12 +33,14 @@ case "${1:-}" in
       echo "The learner is not running."
       exit 0
     fi
+    # The learner saves a final checkpoint with the replay buffers first (buffer_save_freq), which takes minutes.
     ec2_ssh "tmux send-keys -t $SESSION C-c"
-    for _ in $(seq 30); do
+    echo "Stopping; the learner saves its replay buffers first (a few minutes)..."
+    for _ in $(seq 120); do
       running || { echo "Learner stopped."; exit 0; }
-      sleep 1
+      sleep 5
     done
-    echo "Still running after 30 s; force it with: ssh ... tmux kill-session -t $SESSION" >&2
+    echo "Still running after 10 min; force it (loses the unsaved buffers) with: ssh ... tmux kill-session -t $SESSION" >&2
     exit 1
     ;;
   pull)

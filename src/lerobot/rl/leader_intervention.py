@@ -198,13 +198,16 @@ def ee_delta_action_from_joints(
     use_gripper: bool,
     gripper_threshold: float,
     follower_gripper: float | None = None,
+    joint_step_sizes: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Express a commanded move of the follower as a policy action.
 
     The xyz part is the end-effector displacement from `reference_joints` to `target_joints` divided by
     the step sizes and clipped to [-1, 1]. With the previous joint command as reference this is the delta
     the policy would output for `EEReferenceAndDelta` (which works from the previous IK solution, not from
-    the measured pose) to reach the same target. The gripper part is the discrete command that moves the
+    the measured pose) to reach the same target. Joints in `joint_step_sizes` (degrees per unit of action)
+    follow as joint deltas, clipped to [-1, 1]; the policy commands them directly and IK keeps them fixed,
+    so the xyz part still replays exactly. The gripper part is the discrete command that moves the
     follower gripper (`follower_gripper`, default the reference's) towards the target gripper; like
     `GripperVelocityToJoint`, it is relative to the measured gripper position.
     """
@@ -216,6 +219,9 @@ def ee_delta_action_from_joints(
     delta = np.clip((p_target - p_reference) / steps, -1.0, 1.0)
 
     action = delta.tolist()
+    for joint, step in (joint_step_sizes or {}).items():
+        joint_delta = (target_joints[f"{joint}.pos"] - reference_joints[f"{joint}.pos"]) / step
+        action.append(float(np.clip(joint_delta, -1.0, 1.0)))
     if use_gripper:
         current = reference_joints["gripper.pos"] if follower_gripper is None else follower_gripper
         gripper_diff = target_joints["gripper.pos"] - current
@@ -248,6 +254,7 @@ class LeaderArmInterventionStep(ProcessorStep):
         kinematics: Kinematic model of the follower, used for forward kinematics.
         motor_names: Follower motor names, in joint order.
         end_effector_step_sizes: Metres per unit of policy action along x, y and z.
+        joint_step_sizes: Degrees per unit of policy action for joints the policy commands directly.
         use_gripper: Whether the policy action includes the discrete gripper command.
         fps: Control frequency, used to turn `max_joint_speed` into a per-step limit.
         config: Keys, handover duration and speed limit.
@@ -260,6 +267,7 @@ class LeaderArmInterventionStep(ProcessorStep):
     kinematics: RobotKinematics
     motor_names: list[str]
     end_effector_step_sizes: dict[str, float]
+    joint_step_sizes: dict[str, float] = field(default_factory=dict)
     use_gripper: bool = True
     fps: int = 10
     config: LeaderInterventionConfig = field(default_factory=LeaderInterventionConfig)
@@ -347,6 +355,7 @@ class LeaderArmInterventionStep(ProcessorStep):
                 self.use_gripper,
                 self.config.gripper_threshold,
                 follower_gripper=follower["gripper.pos"],
+                joint_step_sizes=self.joint_step_sizes,
             )
             complementary_data[INTERVENTION_JOINT_TARGET_KEY] = dict(self._target)
         else:
@@ -521,6 +530,7 @@ class LeaderArmInterventionStep(ProcessorStep):
         return {
             "motor_names": self.motor_names,
             "end_effector_step_sizes": self.end_effector_step_sizes,
+            "joint_step_sizes": self.joint_step_sizes,
             "use_gripper": self.use_gripper,
             "fps": self.fps,
         }

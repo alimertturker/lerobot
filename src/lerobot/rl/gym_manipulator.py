@@ -146,6 +146,7 @@ class RobotEnv(gym.Env):
         reset_time_s: float = 5.0,
         home_pose: list[float] | None = None,
         release_wait_s: float = 0.0,
+        num_joint_actions: int = 0,
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -157,6 +158,8 @@ class RobotEnv(gym.Env):
             reset_time_s: Time to wait during reset.
             home_pose: Joint positions the robot moves to in `close`, before disconnecting.
             release_wait_s: Time the robot holds still after an episode, before moving to `reset_pose`.
+            num_joint_actions: Number of joint deltas in the action after x, y and z (see
+                `InverseKinematicsConfig.joint_step_sizes`).
         """
         super().__init__()
 
@@ -180,6 +183,7 @@ class RobotEnv(gym.Env):
         self.release_wait_s = release_wait_s
 
         self.use_gripper = use_gripper
+        self.num_joint_actions = num_joint_actions
 
         self._joint_names = list(self.robot.bus.motors.keys())
         self._raw_joint_positions = None
@@ -224,7 +228,7 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
+        action_dim = 3 + self.num_joint_actions
         bounds = {}
         bounds["min"] = -np.ones(action_dim)
         bounds["max"] = np.ones(action_dim)
@@ -387,9 +391,18 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         reset_time_s=reset_cfg.reset_time_s if reset_cfg is not None else 5.0,
         home_pose=reset_cfg.home_joint_positions if reset_cfg is not None else None,
         release_wait_s=reset_cfg.release_wait_s if reset_cfg is not None else 0.0,
+        num_joint_actions=len(_joint_step_sizes(cfg.processor)),
     )
 
     return env, teleop_device
+
+
+def _joint_step_sizes(processor_cfg) -> dict[str, float]:
+    """Joints the policy commands directly, in action order (empty when the action is xyz only)."""
+    ik_cfg = processor_cfg.inverse_kinematics
+    if ik_cfg is None or ik_cfg.joint_step_sizes is None:
+        return {}
+    return dict(ik_cfg.joint_step_sizes)
 
 
 def make_processors(
@@ -522,6 +535,13 @@ def make_processors(
 
     use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False
     leader_mode = cfg.processor.control_mode == "leader"
+    joint_step_sizes = _joint_step_sizes(cfg.processor)
+    unknown_joints = set(joint_step_sizes) - set(motor_names) | ({"gripper"} & set(joint_step_sizes))
+    if unknown_joints:
+        raise ValueError(
+            f"`inverse_kinematics.joint_step_sizes` has invalid joints: {sorted(unknown_joints)}"
+        )
+    joint_names = tuple(joint_step_sizes)
     if leader_mode:
         if kinematics_solver is None or cfg.processor.inverse_kinematics is None:
             raise ValueError(
@@ -544,6 +564,7 @@ def make_processors(
             kinematics=kinematics_solver,
             motor_names=motor_names,
             end_effector_step_sizes=cfg.processor.inverse_kinematics.end_effector_step_sizes,
+            joint_step_sizes=joint_step_sizes,
             use_gripper=use_gripper,
             fps=cfg.fps,
             config=cfg.processor.leader_intervention or LeaderInterventionConfig(),
@@ -573,15 +594,25 @@ def make_processors(
             use_latched_reference=False,
             use_ik_solution=True,
         )
+        ik_cfg = cfg.processor.inverse_kinematics
         ee_bounds_step = EEBoundsAndSafety(
-            end_effector_bounds=cfg.processor.inverse_kinematics.end_effector_bounds,
+            end_effector_bounds=ik_cfg.end_effector_bounds,
+            # With a joint-step limit the IK step bounds every move; the end-effector jump check would also
+            # trip after a shrunk step, since it compares targets rather than the commanded pose.
+            max_ee_step_m=None if ik_cfg.max_joint_step_deg is not None else 0.05,
         )
         ik_step = InverseKinematicsRLStep(
-            kinematics=kinematics_solver, motor_names=motor_names, initial_guess_current_joints=False
+            kinematics=kinematics_solver,
+            motor_names=motor_names,
+            initial_guess_current_joints=False,
+            joint_step_sizes=joint_step_sizes,
+            joint_bounds=dict(ik_cfg.joint_bounds or {}),
+            max_joint_step_deg=ik_cfg.max_joint_step_deg,
+            max_ik_error_m=ik_cfg.max_ik_error_m,
         )
         inverse_kinematics_steps = [
-            MapTensorToDeltaActionDictStep(use_gripper=use_gripper),
-            MapDeltaActionToRobotActionStep(),
+            MapTensorToDeltaActionDictStep(use_gripper=use_gripper, joint_names=joint_names),
+            MapDeltaActionToRobotActionStep(joint_names=joint_names),
             ee_reference_step,
             ee_bounds_step,
             GripperVelocityToJoint(
@@ -748,7 +779,9 @@ def control_loop(
             action_features = teleop_device.action_features
         else:
             # Leader-arm interventions are recorded in the policy's end-effector delta action space.
-            names = ["delta_x", "delta_y", "delta_z"] + (["gripper"] if use_gripper else [])
+            names = ["delta_x", "delta_y", "delta_z"]
+            names += [f"delta_{joint}" for joint in _joint_step_sizes(cfg.env.processor)]
+            names += ["gripper"] if use_gripper else []
             action_features = {
                 "dtype": "float32",
                 "shape": (len(names),),
@@ -804,7 +837,7 @@ def control_loop(
             step_start_time = time.perf_counter()
 
             # Create a neutral action (no movement)
-            neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+            neutral_action = torch.zeros(3 + len(_joint_step_sizes(cfg.env.processor)), dtype=torch.float32)
             if use_gripper:
                 neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
 

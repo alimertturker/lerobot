@@ -39,6 +39,10 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     mixer: str = "online_offline"
     # Fraction sampled from online replay when using OnlineOfflineMixer.
     online_ratio: float = 0.5
+    # Save the replay buffers (slow: minutes for ~20k frames, training and weight pushes stop meanwhile) only
+    # every this many optimization steps instead of at every checkpoint. When set, the learner also saves a
+    # checkpoint with the buffers when it is stopped. None = buffers at every checkpoint.
+    buffer_save_freq: int | None = None
 
     def validate(self) -> None:
         super().validate()
