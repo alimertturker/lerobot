@@ -251,7 +251,7 @@ class LeaderArmInterventionStep(ProcessorStep):
 
     Attributes:
         teleop_device: Actuated leader arm (position feedback and torque control).
-        kinematics: Kinematic model of the follower, used for forward kinematics.
+        kinematics: Kinematic model for EE labels; None for joint-position labels.
         motor_names: Follower motor names, in joint order.
         end_effector_step_sizes: Metres per unit of policy action along x, y and z.
         joint_step_sizes: Degrees per unit of policy action for joints the policy commands directly.
@@ -264,7 +264,7 @@ class LeaderArmInterventionStep(ProcessorStep):
     """
 
     teleop_device: Teleoperator
-    kinematics: RobotKinematics
+    kinematics: RobotKinematics | None
     motor_names: list[str]
     end_effector_step_sizes: dict[str, float]
     joint_step_sizes: dict[str, float] = field(default_factory=dict)
@@ -273,6 +273,8 @@ class LeaderArmInterventionStep(ProcessorStep):
     config: LeaderInterventionConfig = field(default_factory=LeaderInterventionConfig)
     episode_events: KeyboardEpisodeEvents | None = None
     home_pose: dict[str, float] | None = None
+    # VLA recordings use absolute joint targets rather than HIL-SERL's EE deltas.
+    action_representation: str = "ee_delta"
 
     phase: LeaderPhase = field(default=LeaderPhase.AUTONOMOUS, init=False)
     _target: dict[str, float] | None = field(default=None, init=False, repr=False)
@@ -283,6 +285,8 @@ class LeaderArmInterventionStep(ProcessorStep):
     _last_leader_warning: float = field(default=float("-inf"), init=False, repr=False)
 
     def __post_init__(self):
+        if self.action_representation not in ("ee_delta", "joint_positions"):
+            raise ValueError("action_representation must be 'ee_delta' or 'joint_positions'")
         if not teleop_supports_feedback(self.teleop_device):
             raise TypeError(
                 f'control_mode "leader" needs an actuated leader arm with position feedback and torque '
@@ -346,17 +350,7 @@ class LeaderArmInterventionStep(ProcessorStep):
             previous_target = self._target
             if self.phase is LeaderPhase.CORRECTING:
                 self._target = self._rate_limited(previous_target, leader)
-            complementary_data[TELEOP_ACTION_KEY] = ee_delta_action_from_joints(
-                self.kinematics,
-                self.motor_names,
-                previous_target,
-                self._target,
-                self.end_effector_step_sizes,
-                self.use_gripper,
-                self.config.gripper_threshold,
-                follower_gripper=follower["gripper.pos"],
-                joint_step_sizes=self.joint_step_sizes,
-            )
+            complementary_data[TELEOP_ACTION_KEY] = self._intervention_action(previous_target, follower)
             complementary_data[INTERVENTION_JOINT_TARGET_KEY] = dict(self._target)
         else:
             complementary_data[TELEOP_ACTION_KEY] = None
@@ -368,6 +362,26 @@ class LeaderArmInterventionStep(ProcessorStep):
         info[LEADER_PHASE_KEY] = self.phase.value
         new_transition[TransitionKey.INFO] = info
         return new_transition
+
+    def _intervention_action(
+        self, previous_target: dict[str, float], follower: dict[str, float]
+    ) -> np.ndarray:
+        assert self._target is not None
+        if self.action_representation == "joint_positions":
+            return np.asarray([self._target[f"{m}.pos"] for m in self.motor_names], dtype=np.float32)
+        if self.kinematics is None:
+            raise ValueError("EE delta labels require kinematics")
+        return ee_delta_action_from_joints(
+            self.kinematics,
+            self.motor_names,
+            previous_target,
+            self._target,
+            self.end_effector_step_sizes,
+            self.use_gripper,
+            self.config.gripper_threshold,
+            follower_gripper=follower["gripper.pos"],
+            joint_step_sizes=self.joint_step_sizes,
+        )
 
     @property
     def _starts_paused(self) -> bool:
@@ -533,6 +547,7 @@ class LeaderArmInterventionStep(ProcessorStep):
             "joint_step_sizes": self.joint_step_sizes,
             "use_gripper": self.use_gripper,
             "fps": self.fps,
+            "action_representation": self.action_representation,
         }
 
     def transform_features(

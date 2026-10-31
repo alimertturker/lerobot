@@ -1,0 +1,37 @@
+{
+  "policy_path": "outputs/train/base_pi05/checkpoints/last/pretrained_model",
+  "dataset_repo_id": "local/so101_joint_demos",
+  "dataset_root": "data/so101_joint_demos",
+  "output_dir": "outputs/expo_ft_so101",
+  "device": "cuda",
+  "task": "Pick up the cube",
+  "dataset_use_degrees": true,
+  "fps": 10,
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/ttyACM0",
+    "id": "follower",
+    "use_degrees": true,
+    "max_relative_target": 9.0,
+    "cameras": {
+      "wrist": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30},
+      "top": {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30}
+    }
+  },
+  "teleop": {"type": "so101_leader", "port": "/dev/ttyACM1", "id": "leader", "use_degrees": true},
+  "reset_pose": [1.01, -39.03, 45.98, 34.81, -86.37, 10.8],
+  "home_pose": [1.01, -39.03, 45.98, 34.81, -86.37, 10.8],
+  "chunk_steps": 5,
+  "num_candidates": 8,
+  "candidate_batch_size": 2,
+  "num_edits": 8,
+  "edit_scale": 0.2,
+  "batch_size": 16,
+  "demo_episodes": 20,
+  "warmup_updates": 100,
+  "updates_per_episode": 50,
+  "episode_time_s": 60.0,
+  "num_episodes": 100,
+  "leader_intervention": {"follow_follower": true, "pause_key": "space", "success_key": "s",
+                          "failure_keys": ["q", "esc"], "rerecord_key": "r", "max_joint_speed": 90.0}
+}
