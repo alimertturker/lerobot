@@ -28,23 +28,35 @@ class JointSafetyLimitError(RuntimeError):
     """Raised when a measured joint crosses a configured hard rollout limit."""
 
 
+def prepare_replay_image(image: Tensor, size: int = 0) -> Tensor:
+    """Own a CPU uint8 frame; preserve its resolution unless a resize is explicitly requested.
+
+    Clone even contiguous decoder frames: their storage can be reused or contain a whole video batch.
+    The critic makes its smaller input on demand; replay keeps just this one image per camera.
+    """
+    height, width = image.shape[-2:]
+    if size > 0 and max(height, width) > size:
+        shape = (
+            max(1, round(height * size / max(height, width))),
+            max(1, round(width * size / max(height, width))),
+        )
+        image = (
+            functional.interpolate(image[None].float(), shape, mode="bilinear", align_corners=False)[0]
+            .round()
+            .clamp(0, 255)
+        )
+    return image.to(device="cpu", dtype=torch.uint8, copy=True).contiguous()
+
+
 def compact_observation(
-    raw: dict, state_names: list[str], image_keys: list[str], size: int
+    raw: dict, state_names: list[str], image_keys: list[str], size: int = 0
 ) -> dict[str, Tensor]:
+    """Snapshot state and camera pixels for both VLA inference and replay."""
     result = {OBS_STATE: torch.tensor([raw[name] for name in state_names], dtype=torch.float32)}
     for key in image_keys:
         camera = key.removeprefix(f"{OBS_IMAGES}.")
-        frame = torch.from_numpy(np.asarray(raw[camera]).copy()).permute(2, 0, 1)
-        height, width = frame.shape[-2:]
-        if max(height, width) > size:
-            shape = (
-                max(1, round(height * size / max(height, width))),
-                max(1, round(width * size / max(height, width))),
-            )
-            frame = functional.interpolate(frame[None].float(), shape, mode="bilinear", align_corners=False)[
-                0
-            ]
-        result[key] = frame.round().clamp(0, 255).to(torch.uint8)
+        frame = torch.from_numpy(np.asarray(raw[camera])).permute(2, 0, 1)
+        result[key] = prepare_replay_image(frame, size)
     return result
 
 

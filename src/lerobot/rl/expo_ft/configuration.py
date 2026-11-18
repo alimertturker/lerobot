@@ -32,6 +32,20 @@ class ExpoFTConfig:
     output_dir: Path = Path("outputs/expo_ft_so101")
     resume: Path | None = None
     check_only: bool = False  # Validate sampling and one update without connecting hardware or saving.
+    real_time: bool = False  # Delayed VLA proposals, current-observation edits and latency-aware learning.
+    real_time_delay_steps: int = 4  # Prefetch lead in control ticks; must fit in chunk_steps.
+    real_time_filter_candidates: int = 8  # Noise seeds scored before denoising one backup candidate.
+    eval_only: bool = False  # Run num_episodes with fixed checkpoint weights, without training.
+    eval_record: bool = False  # Save accepted evaluation episodes as a separate LeRobot dataset.
+    eval_dataset_repo_id: str = "local/expo_ft_evaluation"
+    eval_dataset_root: Path | None = None  # Defaults to output_dir/evaluation_dataset.
+    eval_dataset_push_to_hub: bool = False
+    eval_dataset_private: bool = True
+    debug_frozen_training: bool = False  # Training loop with zero updates and no checkpoint writes.
+    debug_plan_seed: int | None = None  # Reset RNG to seed + plan index, after checkpoint restoration.
+    capture_control_trace: bool = False  # Buffer per-tick command/timing records until episode end.
+    capture_initial_plan: bool = False  # Save each episode's first planning input, RNG, and output.
+    capture_all_plans: bool = False  # Capture every planning request when investigating a rollout.
     use_startup_poses: bool = False  # Capture the follower reset/home and leader home at connection time.
     rename_map: dict[str, str] = field(default_factory=dict)  # Empty uses the checkpoint's saved mapping.
     device: str = "cuda"
@@ -55,16 +69,20 @@ class ExpoFTConfig:
     hidden_dim: int = 256
     batch_size: int = 16
     vla_batch_size: int = 2
+    train_vla: bool = True  # Disable VLA optimizer steps while continuing critic and edit learning.
     updates_per_episode: int = 50
+    critic_updates_per_update: int = 1
     warmup_updates: int = 100
     critic_lr: float = 3e-4
     edit_lr: float = 3e-4
     vla_lr: float = 1e-5
     temperature: float = 0.01
+    adjust_target_entropy: bool = False  # Account for edit_scale in the entropy target.
     grad_clip_norm: float = 10.0
     replay_capacity: int = 10000  # Frames, evicting entire episodes.
-    storage_image_size: int = 224
+    storage_image_size: int = 0  # 0 preserves camera resolution for VLA inference and replay.
     critic_image_size: int = 96
+    critic_encoder: str = "compact"  # "resnet" matches the released EXPO-FT encoder at 224x224.
     demo_episodes: int = 20
     seed: int = 1000
     joint_bounds: dict[str, list[float]] = field(default_factory=dict)
@@ -76,6 +94,26 @@ class ExpoFTConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.eval_dataset_push_to_hub and (
+            not self.eval_only or not self.eval_record or self.eval_dataset_repo_id.startswith("local/")
+        ):
+            raise ValueError("Evaluation upload requires eval_only=true, eval_record=true and a Hub repo ID")
+        if self.debug_frozen_training and (self.resume is None or self.eval_only or self.check_only):
+            raise ValueError("debug_frozen_training requires resume and eval_only=false, check_only=false")
+        if self.debug_plan_seed is not None and (
+            self.debug_plan_seed < 0 or not (self.eval_only or self.debug_frozen_training)
+        ):
+            raise ValueError("debug_plan_seed must be nonnegative and requires a frozen debug/evaluation run")
+        if self.eval_only and (self.resume is None or self.check_only):
+            raise ValueError(
+                "eval_only requires a checkpoint in resume and cannot be combined with check_only"
+            )
+        if self.real_time and self.debug_plan_seed is not None:
+            raise ValueError("debug_plan_seed currently supports normal EXPO-FT only")
+        if self.real_time and not 0 < self.real_time_delay_steps <= self.chunk_steps:
+            raise ValueError("real_time_delay_steps must be in [1, chunk_steps]")
+        if self.real_time and self.real_time_filter_candidates < 1:
+            raise ValueError("real_time_filter_candidates must be positive")
         positive = (
             "fps",
             "cpu_threads",
@@ -90,8 +128,8 @@ class ExpoFTConfig:
             "hidden_dim",
             "batch_size",
             "vla_batch_size",
+            "critic_updates_per_update",
             "replay_capacity",
-            "storage_image_size",
             "critic_image_size",
             "demo_episodes",
             "save_every",
@@ -111,6 +149,7 @@ class ExpoFTConfig:
             "warmup_updates",
             "release_wait_s",
             "checkpoint_keep_last",
+            "storage_image_size",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be nonnegative")
@@ -130,6 +169,10 @@ class ExpoFTConfig:
             raise ValueError("Robot joint units must match the base dataset's recording units")
         if self.critic_image_size < 32:
             raise ValueError("critic_image_size must be at least 32")
+        if self.critic_encoder not in ("compact", "resnet"):
+            raise ValueError("critic_encoder must be 'compact' or 'resnet'")
+        if self.critic_encoder == "resnet" and self.critic_image_size != 224:
+            raise ValueError("critic_encoder='resnet' requires critic_image_size=224")
         for pose in (self.reset_pose, self.home_pose):
             if pose is None:
                 if not self.use_startup_poses:

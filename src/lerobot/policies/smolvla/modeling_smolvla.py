@@ -282,6 +282,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         noise: Tensor | None = None,
         time: Tensor | None = None,
         reduction: str = "mean",
+        prefix_mask: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Do a full training forward pass to compute the loss.
 
@@ -304,13 +305,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict: dict[str, float] = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, prefix_mask=prefix_mask
+        )
         action_feature = self.config.action_feature
         if action_feature is None:
             raise ValueError("SmolVLA requires an action output feature.")
         losses = losses[:, :, : action_feature.shape[0]]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
+        if prefix_mask is not None:
+            actions_is_pad = prefix_mask if actions_is_pad is None else actions_is_pad | prefix_mask
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
@@ -664,7 +669,7 @@ class VLAFlowMatching(nn.Module):
         dtype = action_emb.dtype
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
-            timestep,
+            timestep.flatten(),
             self.vlm_with_expert.expert_hidden_size,
             self.config.min_period,
             self.config.max_period,
@@ -672,7 +677,11 @@ class VLAFlowMatching(nn.Module):
         )
         time_emb = time_emb.type(dtype=dtype)
 
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        time_emb = (
+            time_emb[:, None, :].expand_as(action_emb)
+            if timestep.ndim == 1
+            else time_emb.reshape(*timestep.shape, -1)
+        )
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
@@ -695,7 +704,16 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        prefix_mask=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -704,11 +722,13 @@ class VLAFlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
+        x_t, u_t, model_time = make_flow_matching_inputs(
+            actions, noise, time, convention=FlowConvention.NOISE_AT_ONE, prefix_mask=prefix_mask
+        )
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, model_time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -776,6 +796,8 @@ class VLAFlowMatching(nn.Module):
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
+            hard_prefix=kwargs.get("hard_prefix"),
+            hard_prefix_mask=kwargs.get("hard_prefix_mask"),
         )
 
     def denoise_step(

@@ -15,10 +15,11 @@
 """PyTorch EXPO-FT: chunk TD, bounded edits, candidate selection, and native VLA flow loss.
 
 Algorithm reference: https://arxiv.org/abs/2605.25477 (equations 1–5).
-This SO-arm adaptation uses joint targets and a small CNN instead of the reference ResNet-50.
+This SO-arm adaptation uses joint targets and selectable compact/reference vision encoders.
 """
 
 import json
+import math
 import os
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
@@ -78,12 +79,18 @@ class ExpoFTLearner:
             cfg.hidden_dim,
             cfg.critic_image_size,
             cfg.num_critics,
+            encoder_type=cfg.critic_encoder,
         ).to(self.device)
         self.target_critics = deepcopy(self.critics).requires_grad_(False)
         self.edit = EditPolicy(
-            cfg.hidden_dim, self.action_dim, cfg.chunk_steps, cfg.hidden_dim, cfg.edit_scale
+            self.critics.feature_dim, self.action_dim, cfg.chunk_steps, cfg.hidden_dim, cfg.edit_scale
         ).to(self.device)
         self.log_temperature = nn.Parameter(torch.tensor(cfg.temperature, device=self.device).log())
+        edit_dim = cfg.chunk_steps * self.action_dim
+        self.target_entropy = -edit_dim / 2
+        if cfg.adjust_target_entropy:
+            # EditPolicy.log_prob includes the scale Jacobian, so match its coordinates.
+            self.target_entropy += edit_dim * math.log(cfg.edit_scale)
         self.critic_optimizer = torch.optim.Adam(self.critics.parameters(), lr=cfg.critic_lr)
         self.edit_optimizer = torch.optim.Adam(self.edit.parameters(), lr=cfg.edit_lr)
         self.temperature_optimizer = torch.optim.Adam([self.log_temperature], lr=cfg.edit_lr)
@@ -134,7 +141,9 @@ class ExpoFTLearner:
             raise ValueError("VLA generated nonfinite actions")
         return candidates
 
-    def select(self, features: Tensor, candidates: Tensor, target: bool = True) -> Tensor:
+    def select(
+        self, features: Tensor, candidates: Tensor, target: bool = True, diagnostics: dict | None = None
+    ) -> Tensor:
         """Maximize conservative Q across unedited AND edited chunk candidates."""
         batch_size, count, horizon, dim = candidates.shape
         if self.cfg.num_edits:
@@ -149,14 +158,22 @@ class ExpoFTLearner:
         subset = torch.randperm(self.cfg.num_critics, device=self.device)[: self.cfg.num_min_critics]
         values = qs[:, subset].min(-1).values.view(batch_size, count)
         indices = values.argmax(-1)
+        if diagnostics is not None:
+            diagnostics.update(
+                critic_subset=subset.detach().cpu().tolist(),
+                candidate_q_values=qs.detach().cpu().view(batch_size, count, -1).tolist(),
+                candidate_scores=values.detach().cpu().tolist(),
+                selected_indices=indices.detach().cpu().tolist(),
+                normalized_candidates=candidates.detach().cpu().tolist(),
+            )
         return candidates[torch.arange(batch_size, device=self.device), indices]
 
     @torch.no_grad()
-    def sample_action_chunk(self, observation: dict[str, Tensor]) -> Tensor:
+    def sample_action_chunk(self, observation: dict[str, Tensor], diagnostics: dict | None = None) -> Tensor:
         candidates = self.candidates([observation])
         batch = self.prepare([observation])  # Also restores the relative-action anchor after microbatching.
         features = self.target_critics.encoder(batch)
-        chosen = self.select(features, candidates)
+        chosen = self.select(features, candidates, diagnostics=diagnostics)
         result = self.postprocessor(chosen).detach().cpu()[0]
         if result.shape != (self.cfg.chunk_steps, self.action_dim) or not torch.isfinite(result).all():
             raise ValueError("Invalid postprocessed joint chunk")
@@ -170,27 +187,53 @@ class ExpoFTLearner:
         nn.utils.clip_grad_norm_(parameters, self.cfg.grad_clip_norm, error_if_nonfinite=True)
         optimizer.step()
 
+    @torch.no_grad()
+    def backup_target(self, samples):
+        next_observations = [s["next_observation"] for s in samples]
+        candidates = self.candidates(next_observations)
+        features = self.target_critics.encoder(self.prepare(next_observations))
+        actions = self.select(features, candidates)
+        qs = self.target_critics.score(features, actions)
+        subset = torch.randperm(self.cfg.num_critics, device=self.device)[: self.cfg.num_min_critics]
+        rewards = torch.stack([s["reward"] for s in samples]).to(self.device)
+        bootstrap = torch.tensor([s["bootstrap"] for s in samples], device=self.device)
+        return rewards + bootstrap * qs[:, subset].min(-1).values
+
+    def vla_loss(self, training_batch, samples=None):
+        return self.policy(training_batch)[0]
+
     def update(self, replay: EpisodeReplay) -> dict[str, float]:
         cfg = self.cfg
-        samples = replay.sample(cfg.batch_size, cfg.chunk_steps, cfg.discount)
+        samples = replay.sample(
+            cfg.batch_size,
+            cfg.chunk_steps,
+            cfg.discount,
+            delay=cfg.real_time_delay_steps if cfg.real_time else 0,
+        )
         observations = [s["observation"] for s in samples]
         batch = self.prepare(observations, torch.stack([s["actions"] for s in samples]))
         actions = batch[ACTION].float()
-        next_observations = [s["next_observation"] for s in samples]
         with torch.no_grad():
-            candidates = self.candidates(next_observations)
-            next_batch = self.prepare(next_observations)
-            next_features = self.target_critics.encoder(next_batch)
-            next_actions = self.select(next_features, candidates)
-            qs = self.target_critics.score(next_features, next_actions)
-            subset = torch.randperm(cfg.num_critics, device=self.device)[: cfg.num_min_critics]
-            rewards = torch.stack([s["reward"] for s in samples]).to(self.device)
-            bootstrap = torch.tensor([s["bootstrap"] for s in samples], device=self.device)
-            target = rewards + bootstrap * qs[:, subset].min(-1).values
-        q_loss = functional.mse_loss(
-            self.critics(batch, actions), target[:, None].expand(-1, cfg.num_critics)
-        )
-        self._step(q_loss, self.critic_optimizer, self.critics.parameters())
+            target = self.backup_target(samples)
+        critic_losses = []
+        for _ in range(cfg.critic_updates_per_update):
+            if critic_losses:
+                samples = replay.sample(
+                    cfg.batch_size,
+                    cfg.chunk_steps,
+                    cfg.discount,
+                    delay=cfg.real_time_delay_steps if cfg.real_time else 0,
+                )
+                observations = [s["observation"] for s in samples]
+                batch = self.prepare(observations, torch.stack([s["actions"] for s in samples]))
+                actions = batch[ACTION].float()
+                with torch.no_grad():
+                    target = self.backup_target(samples)
+            q_loss = functional.mse_loss(
+                self.critics(batch, actions), target[:, None].expand(-1, cfg.num_critics)
+            )
+            self._step(q_loss, self.critic_optimizer, self.critics.parameters())
+            critic_losses.append(q_loss.item())
 
         # Gradients reach the edit actor through Q(action), never through the VLA or critic encoder.
         with torch.no_grad():
@@ -203,8 +246,7 @@ class ExpoFTLearner:
             self._step(edit_loss, self.edit_optimizer, self.edit.parameters())
         finally:
             self.critics.requires_grad_(True)
-        target_entropy = -cfg.chunk_steps * self.action_dim / 2
-        temperature_loss = -(self.log_temperature * (log_prob.detach() + target_entropy)).mean()
+        temperature_loss = -(self.log_temperature * (log_prob.detach() + self.target_entropy)).mean()
         self._step(temperature_loss, self.temperature_optimizer, [self.log_temperature])
 
         with torch.no_grad():
@@ -214,11 +256,12 @@ class ExpoFTLearner:
                 target_param.lerp_(param, cfg.tau)
 
         metrics = {
-            "critic_loss": q_loss.item(),
+            "critic_loss": sum(critic_losses) / len(critic_losses),
+            "critic_updates": float(cfg.critic_updates_per_update),
             "edit_loss": edit_loss.item(),
             "temperature": self.log_temperature.exp().item(),
         }
-        success_samples = replay.sample_success(cfg.vla_batch_size, self.horizon)
+        success_samples = replay.sample_success(cfg.vla_batch_size, self.horizon) if cfg.train_vla else []
         if success_samples:
             self.policy.reset()
             self.policy.train()
@@ -227,7 +270,7 @@ class ExpoFTLearner:
                 torch.stack([s["actions"] for s in success_samples]),
             )
             with self._amp():
-                vla_loss, _ = self.policy(training_batch)
+                vla_loss = self.vla_loss(training_batch, success_samples)
             self._step(vla_loss, self.vla_optimizer, self.policy.parameters())
             metrics["vla_loss"] = vla_loss.item()
         self.policy.eval()

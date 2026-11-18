@@ -46,8 +46,9 @@ class Episode:
 
 
 class EpisodeReplay:
-    def __init__(self, capacity: int, seed: int = 0) -> None:
+    def __init__(self, capacity: int, seed: int = 0, protect_offline: bool = False) -> None:
         self.capacity = capacity
+        self.protect_offline = protect_offline
         self.episodes: deque[Episode] = deque()
         self.frames = 0
         self.generator = torch.Generator().manual_seed(seed)
@@ -55,12 +56,24 @@ class EpisodeReplay:
     def add(self, episode: Episode) -> None:
         if len(episode.actions) > self.capacity:
             raise ValueError("Episode exceeds replay_capacity; increase capacity or shorten episodes")
+        if episode.offline and self.protect_offline:
+            protected = sum(len(item.actions) for item in self.episodes if item.offline)
+            if protected + len(episode.actions) > self.capacity:
+                raise ValueError("Protected demonstrations exceed replay_capacity")
         self.episodes.append(episode)
         self.frames += len(episode.actions)
         while self.frames > self.capacity:
-            self.frames -= len(self.episodes.popleft().actions)
+            victim = next(
+                (item for item in self.episodes if not (self.protect_offline and item.offline)), None
+            )
+            if victim is None:
+                self.episodes.pop()
+                self.frames -= len(episode.actions)
+                raise ValueError("Online replay capacity is exhausted by protected demonstrations")
+            self.episodes = deque(item for item in self.episodes if item is not victim)
+            self.frames -= len(victim.actions)
 
-    def sample(self, batch_size: int, horizon: int, discount: float) -> list[dict[str, Any]]:
+    def sample(self, batch_size: int, horizon: int, discount: float, delay: int = 0) -> list[dict[str, Any]]:
         """Sample contiguous chunks without crossing episode boundaries.
 
         Short terminal chunks repeat the last executed target (absorbing padding) and never bootstrap.
@@ -82,9 +95,12 @@ class EpisodeReplay:
             reward = (episode.rewards[start:end] * discount ** torch.arange(count)).sum()
             samples.append(
                 {
+                    "start": start,
                     "observation": episode.observations[start],
                     "actions": actions,
                     "next_observation": episode.observations[end],
+                    "delayed_next_observation": episode.observations[max(start, end - delay)],
+                    "delay_prefix": episode.actions[max(start, end - delay) : end],
                     "reward": reward,
                     "bootstrap": 0.0 if end == len(episode.actions) else discount**count,
                     "steps": count,
@@ -103,6 +119,7 @@ class EpisodeReplay:
             start = int(torch.randint(len(episode.actions) - horizon + 1, (), generator=self.generator))
             samples.append(
                 {
+                    "start": start,
                     "observation": episode.observations[start],
                     "actions": episode.actions[start : start + horizon],
                 }

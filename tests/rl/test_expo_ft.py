@@ -37,7 +37,7 @@ from lerobot.processor import (
 from lerobot.processor.factory import load_pretrained_policy_processors
 from lerobot.processor.hil_processor import TELEOP_ACTION_KEY
 from lerobot.rl.expo_ft.configuration import ExpoFTConfig
-from lerobot.rl.expo_ft.control import limit_joint_target
+from lerobot.rl.expo_ft.control import JointSafetyLimitError, compact_observation, limit_joint_target
 from lerobot.rl.expo_ft.learner import ExpoFTLearner
 from lerobot.rl.expo_ft.replay import Episode, EpisodeReplay
 from lerobot.rl.expo_ft.train import run_episode
@@ -136,6 +136,84 @@ class Processor:
 
 def learner(cfg):
     return ExpoFTLearner(cfg, TinyVLA(), Processor(), Processor())
+
+
+def test_native_images_reach_vla_and_replay_while_critic_resizes(cfg, tmp_path, monkeypatch):
+    cfg.storage_image_size = 0
+    pixels = np.random.default_rng(0).integers(0, 256, (480, 640, 3), dtype=np.uint8)
+    expected = torch.from_numpy(pixels.copy()).permute(2, 0, 1)
+    obs = compact_observation({**joints(), "wrist": pixels}, list(joints()), [IMAGE])
+    pixels.fill(0)  # A camera reusing its buffer must not change the stored observation.
+    assert torch.equal(obs[IMAGE], expected)
+    assert obs[IMAGE].device.type == "cpu" and obs[IMAGE].dtype == torch.uint8
+
+    entry = episode(4)
+    entry.observations = [obs] * 5
+    replay = EpisodeReplay(100)
+    replay.add(entry)
+    saved = replay.save_shared(tmp_path / "replay")
+    restored = EpisodeReplay(100)
+    restored.load_shared(saved, tmp_path / "replay")
+    assert torch.equal(restored.episodes[0].observations[0][IMAGE], expected)
+
+    agent = learner(cfg)
+    inference_shapes, training_shapes, critic_shapes = [], [], []
+    predict = agent.policy.predict_action_chunk
+
+    def capture_prediction(batch):
+        inference_shapes.append(tuple(batch[IMAGE].shape[-2:]))
+        return predict(batch)
+
+    monkeypatch.setattr(agent.policy, "predict_action_chunk", capture_prediction)
+    agent.policy.register_forward_pre_hook(
+        lambda module, inputs: training_shapes.append(tuple(inputs[0][IMAGE].shape[-2:]))
+    )
+    for critics in (agent.critics, agent.target_critics):
+        critics.encoder.images["0"][0].register_forward_pre_hook(
+            lambda module, inputs: critic_shapes.append(tuple(inputs[0].shape[-2:]))
+        )
+    agent.sample_action_chunk(obs)
+    agent.update(restored)
+    assert inference_shapes and set(inference_shapes) == {(480, 640)}
+    assert training_shapes == [(480, 640)]
+    assert critic_shapes and set(critic_shapes) == {(cfg.critic_image_size, cfg.critic_image_size)}
+    assert torch.equal(obs[IMAGE], expected)
+
+
+@pytest.mark.parametrize("size,expected_shape", [(0, (3, 480, 640)), (224, (3, 168, 224))])
+def test_demonstration_images_use_the_same_storage_setting(cfg, monkeypatch, size, expected_shape):
+    from lerobot.rl.expo_ft import train as train_module
+
+    cfg.storage_image_size = size
+    frame = observation()
+    pixels = torch.full((3, 480, 640), 123, dtype=torch.uint8)
+    frame.update({IMAGE: pixels, ACTION: torch.zeros(6), "episode_index": 0})
+    monkeypatch.setattr(
+        train_module, "LeRobotDatasetMetadata", lambda *args, **kwargs: SimpleNamespace(total_episodes=1)
+    )
+    monkeypatch.setattr(train_module, "LeRobotDataset", lambda *args, **kwargs: [frame] * 4)
+    replay = EpisodeReplay(100)
+    train_module.load_demonstrations(cfg, learner(cfg), replay)
+    pixels.zero_()  # Dataset decoder storage is also owned independently by replay.
+    stored = replay.episodes[0].observations[0][IMAGE]
+    assert tuple(stored.shape) == expected_shape
+    assert stored.dtype == torch.uint8 and stored.device.type == "cpu"
+    assert (stored == 123).all()
+
+
+def test_resume_rejects_switching_old_replay_to_native_resolution(cfg, tmp_path):
+    import json
+
+    from lerobot.rl.expo_ft.train import load_learner
+
+    cfg.resume = tmp_path / "old_checkpoint"
+    cfg.resume.mkdir()
+    cfg.storage_image_size = 0
+    (cfg.resume / "expo_ft_config.json").write_text(
+        json.dumps({"chunk_steps": cfg.chunk_steps, "storage_image_size": 224})
+    )
+    with pytest.raises(ValueError, match="Downscaled replay cannot recover original pixels"):
+        load_learner(cfg)
 
 
 def test_joint_interventions_need_no_ik_and_preserve_follow_mode():
@@ -240,7 +318,8 @@ def test_update_changes_vla_edit_critics_and_target(cfg):
         for name in ("policy", "edit", "critics", "target_critics")
     }
     metrics = agent.update(replay)
-    assert set(metrics) == {"critic_loss", "edit_loss", "temperature", "vla_loss"}
+    assert set(metrics) == {"critic_loss", "critic_updates", "edit_loss", "temperature", "vla_loss"}
+    assert metrics["critic_updates"] == cfg.critic_updates_per_update
     for name, params in before.items():
         assert any(
             not torch.equal(old, new)
@@ -256,6 +335,46 @@ def test_failed_episode_does_not_update_vla(cfg):
     before = agent.policy.weight.detach().clone()
     assert "vla_loss" not in agent.update(replay)
     assert torch.equal(before, agent.policy.weight)
+
+
+def test_disabled_vla_updates_keep_policy_fixed_but_train_rl(cfg):
+    torch.set_num_threads(1)
+    cfg.train_vla = False
+    agent = learner(cfg)
+    replay = EpisodeReplay(100)
+    replay.add(episode(success=True))
+    before = {
+        name: [p.detach().clone() for p in getattr(agent, name).parameters()]
+        for name in ("policy", "edit", "critics")
+    }
+    metrics = agent.update(replay)
+    assert "vla_loss" not in metrics
+    assert all(torch.equal(a, b) for a, b in zip(before["policy"], agent.policy.parameters(), strict=True))
+    for name in ("edit", "critics"):
+        assert any(
+            not torch.equal(a, b)
+            for a, b in zip(before[name], getattr(agent, name).parameters(), strict=True)
+        )
+
+
+@pytest.mark.parametrize("adjusted", [False, True])
+def test_temperature_update_accounts_for_small_edit_scale(cfg, adjusted):
+    torch.set_num_threads(1)
+    torch.manual_seed(0)
+    cfg.edit_scale = 0.03
+    cfg.adjust_target_entropy = adjusted
+    agent = learner(cfg)
+    replay = EpisodeReplay(100)
+    replay.add(episode())
+    before = agent.log_temperature.detach().exp().item()
+    metrics = agent.update(replay)
+    assert np.isfinite(metrics["edit_loss"])
+    # The initial edit distribution exceeds the adjusted target entropy. The legacy target
+    # is unattainable at this scale and instead pushes temperature upward on the same sample.
+    if adjusted:
+        assert metrics["temperature"] < before
+    else:
+        assert metrics["temperature"] > before
 
 
 def test_checkpoint_restores_models_optimizers_and_replay(cfg, tmp_path):
@@ -374,7 +493,8 @@ def test_existing_run_requires_explicit_resume(cfg):
 
 def test_joint_limits_cap_policy_and_corrections_and_reject_nonfinite():
     assert limit_joint_target({"a": 200}, {"a": 0}, 9, {"a": [-20, 20]}) == {"a": 9}
-    assert limit_joint_target({"a": 200}, {"a": 40}, 9, {"a": [-20, 20]}) == {"a": 31}
+    with pytest.raises(JointSafetyLimitError, match="outside the configured safety bound"):
+        limit_joint_target({"a": 200}, {"a": 40}, 9, {"a": [-20, 20]})
     with pytest.raises(ValueError, match="Nonfinite"):
         limit_joint_target({"a": float("nan")}, {"a": 0}, 9, {})
 
@@ -478,21 +598,21 @@ def test_example_config_roundtrip():
     config = draccus.parse(ExpoFTConfig, config_path=path, args=[])
     restored = draccus.decode(ExpoFTConfig, draccus.encode(config))
     assert restored.leader_intervention.follow_follower
-    assert restored.num_candidates == 8
+    assert restored.num_candidates == 4
     assert restored.robot.use_degrees == restored.dataset_use_degrees
 
 
-def test_jenga_config_and_startup_poses_keep_separate_leader_home(cfg):
+@pytest.mark.parametrize("preset", [None, [5.0] * 6])
+def test_startup_poses_keep_separate_leader_home(cfg, preset):
     from lerobot.rl.expo_ft.train import capture_home_poses
 
-    path = Path(__file__).parents[2] / "examples/expo_ft_so101/configs/jenga_smolvla.json"
-    config = draccus.parse(ExpoFTConfig, config_path=path, args=[])
-    assert config.use_startup_poses and config.reset_pose is None and config.home_pose is None
+    cfg.use_startup_poses = True
+    cfg.reset_pose = cfg.home_pose = preset
     names = [f"{m}.pos" for m in MOTORS]
     robot = SimpleNamespace(get_observation=lambda: dict.fromkeys(names, 12.0))
     leader = SimpleNamespace(get_action=lambda: dict.fromkeys(names, -20.0))
-    home = capture_home_poses(config, robot, leader, names)
-    assert config.reset_pose == config.home_pose == [12.0] * 6
+    home = capture_home_poses(cfg, robot, leader, names)
+    assert cfg.reset_pose == cfg.home_pose == (preset if preset is not None else [12.0] * 6)
     assert home == dict.fromkeys(names, -20.0)
 
 

@@ -26,7 +26,6 @@ from typing import Any
 
 import draccus
 import torch
-import torch.nn.functional as functional
 
 from lerobot.cameras import opencv  # noqa: F401 (register camera config)
 from lerobot.configs import PreTrainedConfig
@@ -48,8 +47,11 @@ from lerobot.utils.robot_utils import precise_sleep
 
 from .checkpointing import CHECKPOINT_MARKER, prune_checkpoints
 from .configuration import ExpoFTConfig
-from .control import JointSafetyLimitError, compact_observation, limit_joint_target
+from .control import JointSafetyLimitError, compact_observation, limit_joint_target, prepare_replay_image
+from .diagnostics import ControlTrace, capture_initial_plan, flush_captures, sample_debug_plan
+from .evaluation import EvaluationRecorder
 from .learner import ExpoFTLearner
+from .realtime import RealTimeEXPOFTLearner, RealTimePlanner
 from .replay import Episode, EpisodeReplay
 
 logger = logging.getLogger(__name__)
@@ -72,11 +74,39 @@ def load_learner(cfg: ExpoFTConfig) -> tuple[ExpoFTLearner, Any, EpisodeReplay, 
             )
     if cfg.resume:
         saved_config = cfg.resume / "expo_ft_config.json"
-        if saved_config.exists() and json.loads(saved_config.read_text())["chunk_steps"] != cfg.chunk_steps:
-            raise ValueError(
-                "chunk_steps differs from the saved critics/edit policy. Start a fresh run or "
-                "restore the checkpoint's original chunk_steps."
-            )
+        if saved_config.exists():
+            saved = json.loads(saved_config.read_text())
+            if saved.get("real_time", False) != cfg.real_time:
+                raise ValueError(
+                    "real_time differs from checkpoint; start a fresh RL run with resume=null and policy_path=<checkpoint>/pretrained_model"
+                )
+            if cfg.real_time and saved.get("real_time_delay_steps", 4) != cfg.real_time_delay_steps:
+                raise ValueError(
+                    "real_time_delay_steps differs from checkpoint; use the saved delay or start a fresh run"
+                )
+            saved_encoder = saved.get("critic_encoder", "compact")
+            if saved_encoder != cfg.critic_encoder or (
+                saved_encoder == "resnet" and saved.get("critic_image_size") != cfg.critic_image_size
+            ):
+                raise ValueError(
+                    "critic_encoder/critic_image_size differs from the checkpoint architecture. "
+                    "Start a fresh RL run with resume=null and a new output_dir, or restore the "
+                    "checkpoint's encoder settings (older checkpoints use critic_encoder='compact')."
+                )
+            if saved["chunk_steps"] != cfg.chunk_steps:
+                raise ValueError(
+                    "chunk_steps differs from the saved critics/edit policy. Start a fresh run or "
+                    "restore the checkpoint's original chunk_steps."
+                )
+            # Before native-resolution storage, omitted storage_image_size defaulted to 224.
+            saved_image_size = saved.get("storage_image_size", 224)
+            if saved_image_size != cfg.storage_image_size:
+                raise ValueError(
+                    f"storage_image_size differs from saved replay ({saved_image_size} -> "
+                    f"{cfg.storage_image_size}). Downscaled replay cannot recover original pixels. "
+                    "Resume with the original storage_image_size, or start a fresh run with "
+                    "resume=null and policy_path pointing to the desired pretrained_model directory."
+                )
     torch.set_num_threads(cfg.cpu_threads)
     torch.manual_seed(cfg.seed)
     if cfg.device.startswith("cuda") and not torch.cuda.is_available():
@@ -124,9 +154,36 @@ def load_learner(cfg: ExpoFTConfig) -> tuple[ExpoFTLearner, Any, EpisodeReplay, 
     image_keys = [
         key for key in metadata.camera_keys if cfg.rename_map.get(key, key) in policy_cfg.image_features
     ]
-    learner = ExpoFTLearner(cfg, policy, preprocessor, postprocessor, image_keys=image_keys)
+    learner_class = RealTimeEXPOFTLearner if cfg.real_time else ExpoFTLearner
+    learner = learner_class(cfg, policy, preprocessor, postprocessor, image_keys=image_keys)
+    logger.info("EXPO-FT mode: %s", "real-time" if cfg.real_time else "normal")
     logger.info("VLA ready; dataset cameras=%s, rename_map=%s", image_keys, cfg.rename_map)
-    replay = EpisodeReplay(cfg.replay_capacity, cfg.seed)
+    logger.info(
+        "Critic encoder: %s (%s parameters; feature dimension %d)",
+        cfg.critic_encoder,
+        f"{sum(p.numel() for p in learner.critics.encoder.parameters()):,}",
+        learner.critics.feature_dim,
+    )
+    logger.info(
+        "Action selection: base_candidates=%d edited_candidates=%d executed_steps=%d fps=%d "
+        "edit_scale=%g critic_subset=%d/%d stochastic=true policy_training=%s",
+        cfg.num_candidates,
+        cfg.num_edits,
+        cfg.chunk_steps,
+        cfg.fps,
+        cfg.edit_scale,
+        cfg.num_min_critics,
+        cfg.num_critics,
+        learner.policy.training,
+    )
+    logger.info(
+        "Camera storage for VLA/replay: %s; critic inputs: %dx%d; replay capacity: %d frames",
+        "native resolution" if cfg.storage_image_size == 0 else f"max side {cfg.storage_image_size}px",
+        cfg.critic_image_size,
+        cfg.critic_image_size,
+        cfg.replay_capacity,
+    )
+    replay = EpisodeReplay(cfg.replay_capacity, cfg.seed, protect_offline=cfg.demo_episodes > 0)
     episodes = learner.restore(cfg.resume, replay) if cfg.resume else 0
     return learner, metadata, replay, episodes
 
@@ -186,16 +243,7 @@ def load_demonstrations(cfg: ExpoFTConfig, learner: ExpoFTLearner, replay: Episo
             image = frame[key]
             if image.dtype != torch.uint8:
                 image = (image * 255).round().clamp(0, 255).to(torch.uint8)
-            height, width = image.shape[-2:]
-            if max(height, width) > cfg.storage_image_size:
-                shape = (
-                    max(1, round(height * cfg.storage_image_size / max(height, width))),
-                    max(1, round(width * cfg.storage_image_size / max(height, width))),
-                )
-                image = functional.interpolate(
-                    image[None].float(), shape, mode="bilinear", align_corners=False
-                )[0]
-            observation[key] = image.round().clamp(0, 255).to(torch.uint8).cpu()
+            observation[key] = prepare_replay_image(image, cfg.storage_image_size)
         observations.append(observation)
         actions.append(frame[ACTION].float().cpu())
     finish()
@@ -295,6 +343,7 @@ def run_episode(
     generation = 0
     chunk: torch.Tensor | None = None
     chunk_index = 0
+    active_plan_index = None
     success = False
     discard = False
     last_phase = intervention.phase
@@ -305,10 +354,16 @@ def run_episode(
     planning_elapsed_s = 0.0
     safety_limit_reason: str | None = None
     request_started = started
+    realtime = RealTimePlanner(learner, worker) if cfg.real_time else None
+    trace = ControlTrace(cfg, action_names)
     raw = robot.get_observation()
+    read_ns = time.monotonic_ns()
     try:
         while True:
             tick = time.monotonic()
+            trace.add(
+                "tick", observation_read_ns=read_ns, measured={key: float(raw[key]) for key in state_names}
+            )
             observation = compact_observation(raw, state_names, learner.image_keys, cfg.storage_image_size)
             transition = intervention(
                 create_transition(
@@ -318,34 +373,115 @@ def run_episode(
             )
             info = transition[TransitionKey.INFO]
             phase = intervention.phase
+            trace.add("phase", phase=phase.name)
             if phase is not last_phase:
                 generation += 1
+                if realtime is not None:
+                    realtime.cancel()
                 chunk = None
                 last_phase = phase
             success = info[TeleopEvents.SUCCESS]
             discard = info[TeleopEvents.RERECORD_EPISODE]
             if success or info[TeleopEvents.TERMINATE_EPISODE] or tick - started >= cfg.episode_time_s:
+                trace.add(
+                    "stop",
+                    success=bool(success),
+                    discard=bool(discard),
+                    terminated=bool(info[TeleopEvents.TERMINATE_EPISODE]),
+                    timeout=tick - started >= cfg.episode_time_s,
+                )
                 break
 
-            if pending is not None and pending.done():
-                result = pending.result()  # Propagate worker failures; never continue on a failed inference.
-                planning_elapsed_s += time.monotonic() - request_started
-                completed_plans += 1
-                pending = None
-                if request_generation == generation and phase is LeaderPhase.AUTONOMOUS:
-                    chunk, chunk_index = result, 0
-
-            if phase is LeaderPhase.AUTONOMOUS and chunk is None and pending is None:
-                request_generation = generation
-                request_started = time.monotonic()
-                pending = worker.submit(learner.sample_action_chunk, observation)
-                plan_count += 1
-                # Do not waste a control tick when a cached/fast planner finishes immediately.
-                if pending.done():
-                    chunk, chunk_index = pending.result(), 0
+            if realtime is not None and phase is LeaderPhase.AUTONOMOUS:
+                if chunk is None:
+                    raw = robot.get_observation()
+                    read_ns = time.monotonic_ns()
+                    observation = compact_observation(
+                        raw, state_names, learner.image_keys, cfg.storage_image_size
+                    )
+                    if realtime.pending is None:
+                        realtime.request(observation)
+                        trace.add(
+                            "plan_requested",
+                            plan_index=realtime.request_count - 1,
+                            delay=0,
+                            observation_read_ns=read_ns,
+                        )
+                    chunk = realtime.take(observation)
+                    if chunk is not None:
+                        chunk_index = 0
+                        active_plan_index = realtime.selected_index
+                        trace.add("plan_consumed", plan_index=active_plan_index, accepted=True)
+                if (
+                    chunk is not None
+                    and len(chunk) - chunk_index == cfg.real_time_delay_steps
+                    and realtime.pending is None
+                ):
+                    raw = robot.get_observation()
+                    read_ns = time.monotonic_ns()
+                    observation = compact_observation(
+                        raw, state_names, learner.image_keys, cfg.storage_image_size
+                    )
+                    realtime.request(observation, chunk[chunk_index:].clone())
+                    trace.add(
+                        "plan_requested",
+                        plan_index=realtime.request_count - 1,
+                        delay=cfg.real_time_delay_steps,
+                        observation_read_ns=read_ns,
+                    )
+                plan_count = realtime.request_count
+                completed_plans = realtime.completed
+                planning_elapsed_s = realtime.total_latency
+            if realtime is None:
+                if pending is not None and pending.done():
+                    trace.add(
+                        "plan_consumed",
+                        plan_index=plan_count - 1,
+                        accepted=request_generation == generation and phase is LeaderPhase.AUTONOMOUS,
+                    )
+                    result = (
+                        pending.result()
+                    )  # Propagate worker failures; never continue on a failed inference.
                     planning_elapsed_s += time.monotonic() - request_started
                     completed_plans += 1
                     pending = None
+                    if request_generation == generation and phase is LeaderPhase.AUTONOMOUS:
+                        chunk, chunk_index = result, 0
+                        active_plan_index = plan_count - 1
+
+                if phase is LeaderPhase.AUTONOMOUS and chunk is None and pending is None:
+                    # Intervention processing may block while the leader catches up or parks.
+                    # Plan from a new observation after that movement, rather than the pre-handover frame.
+                    raw = robot.get_observation()
+                    read_ns = time.monotonic_ns()
+                    observation = compact_observation(
+                        raw, state_names, learner.image_keys, cfg.storage_image_size
+                    )
+                    request_generation = generation
+                    request_started = time.monotonic()
+                    trace.add(
+                        "plan_requested",
+                        plan_index=plan_count,
+                        observation_read_ns=read_ns,
+                        measured={key: float(raw[key]) for key in state_names},
+                    )
+                    if cfg.debug_plan_seed is not None or cfg.capture_control_trace:
+                        pending = worker.submit(
+                            sample_debug_plan, learner, observation, plan_count, trace.episode_id
+                        )
+                    elif cfg.capture_all_plans or (cfg.capture_initial_plan and plan_count == 0):
+                        pending = worker.submit(capture_initial_plan, learner, observation)
+                    else:
+                        pending = worker.submit(learner.sample_action_chunk, observation)
+                    plan_count += 1
+                    # Do not waste a control tick when a cached/fast planner finishes immediately.
+                    if pending.done():
+                        trace.add("plan_consumed", plan_index=plan_count - 1, accepted=True)
+                        chunk, chunk_index = pending.result(), 0
+                        active_plan_index = plan_count - 1
+                        planning_elapsed_s += time.monotonic() - request_started
+                        completed_plans += 1
+                        pending = None
 
             desired = None
             if phase is not LeaderPhase.AUTONOMOUS:
@@ -356,10 +492,22 @@ def run_episode(
                 if chunk_index == len(chunk):
                     chunk = None
             if desired is not None:
+                requested = dict(desired)
                 desired = limit_joint_target(
                     desired, raw, cfg.leader_intervention.max_joint_speed / cfg.fps, cfg.joint_bounds
                 )
+                send_started_ns = time.monotonic_ns()
                 sent = robot.send_action(desired)
+                trace.add(
+                    "command",
+                    send_started_ns=send_started_ns,
+                    requested=requested,
+                    limited=dict(desired),
+                    sent=dict(sent),
+                    phase=phase.name,
+                    plan_index=active_plan_index if phase is LeaderPhase.AUTONOMOUS else None,
+                    action_index=chunk_index - 1 if phase is LeaderPhase.AUTONOMOUS else None,
+                )
                 if phase is not LeaderPhase.AUTONOMOUS:
                     # Keep the controller's reference at the limited target actually sent to the follower.
                     intervention._target = dict(sent)
@@ -371,11 +519,17 @@ def run_episode(
             if desired is None and phase is LeaderPhase.AUTONOMOUS:
                 planning_wait_s += time.monotonic() - tick
             raw = robot.get_observation()
+            read_ns = time.monotonic_ns()
     except JointSafetyLimitError as exc:
         safety_limit_reason = str(exc)
+        trace.add("safety_limit", reason=safety_limit_reason)
     finally:
+        trace.add("loop_exit", success=bool(success), discarded=bool(discard), steps=len(actions))
+        trace.finish()
         # Hold a released leader immediately, before waiting on any in-flight GPU call.
         intervention.reset()
+        if realtime is not None:
+            realtime.cancel()
         # Do not let an old inference race with the next episode's training/preprocessor state.
         if pending is not None:
             pending.cancel()
@@ -416,6 +570,22 @@ def run_episode(
 
 def train(cfg: ExpoFTConfig) -> None:
     learner, metadata, replay, episodes = load_learner(cfg)
+    logger.info(
+        "Online VLA updates: %s",
+        "enabled" if cfg.train_vla and not (cfg.eval_only or cfg.debug_frozen_training) else "disabled",
+    )
+    if cfg.eval_only:
+        logger.info(
+            "Evaluation only: checkpoint episode %d, %d evaluation episodes", episodes, cfg.num_episodes
+        )
+        episodes = 0
+    if cfg.debug_frozen_training:
+        logger.info(
+            "Frozen training debug: %d episodes; all optimizer updates and checkpoint saves disabled",
+            cfg.num_episodes,
+        )
+        episodes = 0
+    successes = 0
     robot = make_robot_from_config(cfg.robot)
     leader = make_teleoperator_from_config(cfg.teleop)
     action_names = feature_names(metadata, ACTION)
@@ -450,7 +620,10 @@ def train(cfg: ExpoFTConfig) -> None:
     intervention = None
     safety_stop = False
     # A single worker serializes all GPU operations and stateful processor calls.
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="expo-ft-gpu") as worker:
+    with (
+        EvaluationRecorder(cfg, action_names, state_names) as recorder,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="expo-ft-gpu") as worker,
+    ):
         try:
             robot.connect(calibrate=False)
             leader.connect(calibrate=False)
@@ -488,10 +661,28 @@ def train(cfg: ExpoFTConfig) -> None:
                 precise_sleep(cfg.release_wait_s)
                 if episode is None:
                     continue
+                if cfg.eval_only:
+                    recorder.add(episode)
+                    episodes += 1
+                    successes += int(episode.success)
+                    logger.info(
+                        "Evaluation: episode=%d/%d successes=%d success_rate=%.1f%% interventions=%d",
+                        episodes,
+                        cfg.num_episodes,
+                        successes,
+                        100 * successes / episodes,
+                        int(episode.interventions.sum()),
+                    )
+                    continue
                 replay.add(episode)
                 episodes += 1
                 # Training runs between episodes; the follower holds and the leader keeps following it.
-                future = worker.submit(train_updates, learner, replay, cfg.updates_per_episode)
+                future = worker.submit(
+                    train_updates,
+                    learner,
+                    replay,
+                    0 if cfg.debug_frozen_training else cfg.updates_per_episode,
+                )
                 while not future.done():
                     follower_pose = robot.get_observation()
                     if cfg.leader_intervention.follow_follower:
@@ -500,7 +691,7 @@ def train(cfg: ExpoFTConfig) -> None:
                         )
                     precise_sleep(1 / cfg.fps)
                 future.result()
-                if episodes % cfg.save_every == 0:
+                if not cfg.debug_frozen_training and episodes % cfg.save_every == 0:
                     worker.submit(save_checkpoint, learner, replay, episodes).result()
         except JointSafetyLimitError:
             safety_stop = True
@@ -510,12 +701,21 @@ def train(cfg: ExpoFTConfig) -> None:
             # Every callback runs even if another hardware cleanup fails. Saving is last and is
             # serialized behind any in-flight GPU update, including on Ctrl+C.
             with ExitStack() as cleanup:
-                cleanup.callback(lambda: worker.submit(save_checkpoint, learner, replay, episodes).result())
+                cleanup.callback(flush_captures)
+                if not (cfg.eval_only or cfg.debug_frozen_training):
+                    cleanup.callback(
+                        lambda: worker.submit(save_checkpoint, learner, replay, episodes).result()
+                    )
                 if robot.is_connected:
                     cleanup.callback(robot.disconnect)
                 if leader.is_connected:
                     cleanup.callback(leader.disconnect)
-                if not safety_stop and robot.is_connected and robot.is_calibrated and cfg.home_pose is not None:
+                if (
+                    not safety_stop
+                    and robot.is_connected
+                    and robot.is_calibrated
+                    and cfg.home_pose is not None
+                ):
                     raw = robot.get_observation()
                     duration = max(
                         cfg.reset_time_s,
@@ -565,6 +765,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logger.info("Writing training and episode metrics to %s", cfg.output_dir / "train.log")
+    # Evaluation produces no checkpoints, so preserve its actual CLI-resolved settings separately.
+    # Unique names also retain settings from each restart when train.log is appended.
+    run_config = cfg.output_dir / f"run_config_{time.time_ns()}.json"
+    run_config.write_text(json.dumps(draccus.encode(cfg), indent=2))
+    logger.info("Effective configuration (including CLI overrides): %s", run_config)
     train(cfg)
 
 

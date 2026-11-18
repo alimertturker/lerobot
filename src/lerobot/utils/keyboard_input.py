@@ -361,7 +361,16 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
     """
     suffix = f" ({controls_help})" if controls_help else ""
 
-    if pynput_can_capture() and keyboard is not None:
+    # Prefer the controlling terminal on Linux when one is available.  A
+    # pynput listener can report that it started while its X11 hook is still
+    # unable to receive events (common with XWayland, VNC and SSH sessions).
+    # The terminal backend is deterministic in this case; the terminal only
+    # needs to remain focused, which is also where the recording command is
+    # running.  Keep pynput for non-interactive Linux processes and for
+    # platforms without a POSIX terminal backend.
+    prefer_terminal = platform.system() == "Linux" and sys.stdin.isatty()
+
+    if not prefer_terminal and pynput_can_capture() and keyboard is not None:
 
         def on_press(key):
             with contextlib.suppress(Exception):
